@@ -1,0 +1,19 @@
+# Keep the build context tiny
+.next/
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.git/
+.github/
+.env
+.env.*
+*.env
+*.md
+scripts/
+models/
+*.pth
+*.ckpt
+*.safetensors
