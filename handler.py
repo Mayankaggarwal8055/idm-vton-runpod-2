@@ -605,10 +605,21 @@ def run_idm_vton_inference(
     if auto_crop:
         target_width = int(min(width, height * (TARGET_W / TARGET_H)))
         target_height = int(min(height, width * (TARGET_H / TARGET_W)))
-        left = (width - target_width) / 2
-        top = (height - target_height) / 2
-        right = (width + target_width) / 2
-        bottom = (height + target_height) / 2
+
+        is_full_body = cloth_type in ("dresses", "lower_body", "full_body")
+        if is_full_body:
+            # Bottom-anchored crop: keep the bottom portion, sacrifice top
+            left = (width - target_width) / 2
+            bottom = height
+            top = height - target_height
+            right = (width + target_width) / 2
+        else:
+            # Center-anchored crop (default for upper_body)
+            left = (width - target_width) / 2
+            top = (height - target_height) / 2
+            right = (width + target_width) / 2
+            bottom = (height + target_height) / 2
+
         cropped_img = human_img_orig.crop((left, top, right, bottom))
         crop_size = cropped_img.size
         human_img = cropped_img.resize(TARGET_SIZE)
@@ -647,6 +658,56 @@ def run_idm_vton_inference(
         mask_meta["mask_type_used"] = "automasker"
 
     mask = apply_protected_mask(mask, protected_mask)
+
+    # Lower-body silhouette enhancement: AND mask with garment silhouette
+    # clipped to editable body labels to prevent mask bleeding into upper body
+    if cloth_type == "lower_body":
+        from mask_pipeline import (
+            EDITABLE_BODY_REGIONS,
+            _LABEL_PANTS, _LABEL_SKIRT, _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG,
+        )
+        _target_labels = EDITABLE_BODY_REGIONS.get("lower_body", set())
+
+        # Get garment silhouette from garment image
+        garm_gray = np.array(garm_img.convert("L"), dtype=np.uint8)
+        _, garm_silhouette_mask = cv2.threshold(garm_gray, 240, 255, cv2.THRESH_BINARY_INV)
+
+        # Get SCHP body region labels — model_parse is at half-res (512x384),
+        # upsample to match garm_silhouette_mask (1024x768)
+        _schp_body = np.isin(model_parse, list(_target_labels)).astype(np.uint8) * 255
+        _schp_body = cv2.resize(_schp_body, (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        # AND: only keep silhouette pixels that overlap with body region
+        _clipped = np.minimum(garm_silhouette_mask, _schp_body)
+
+        # Check if AND removed too much (>25% of silhouette pixels)
+        silhouette_px = int(np.sum(garm_silhouette_mask > 127))
+        clipped_px = int(np.sum(_clipped > 127))
+        if silhouette_px > 0 and clipped_px < silhouette_px * 0.75:
+            # Geometric fallback: SCHP misclassified legs as upper_clothes
+            # Use dilated all-body mask instead
+            _all_body = np.isin(model_parse, list(range(1, 17))).astype(np.uint8) * 255
+            _all_body = cv2.resize(_all_body, (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+            _clipped = np.minimum(garm_silhouette_mask, _all_body)
+            # Morphological closing to fill holes from jeans
+            close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            _clipped = cv2.morphologyEx(_clipped, cv2.MORPH_CLOSE, close_kernel)
+            logger.info("lower_body_geometric_fallback silhouette_px=%d clipped_px=%d", silhouette_px, clipped_px)
+
+        # Merge enhanced silhouette into mask
+        mask_np = np.array(mask.convert("L"), dtype=np.uint8)
+        mask_np = np.maximum(mask_np, _clipped)
+
+        # Hard upper-body exclusion: zero out anything above the mask's
+        # topmost row to prevent silhouette bleed into the torso
+        rows_with_mask = np.where(mask_np.any(axis=1))[0]
+        if len(rows_with_mask) > 0:
+            mask_top = int(rows_with_mask[0])
+            exclude_top = max(0, mask_top - 8)
+            mask_np[:exclude_top, :] = 0
+
+        mask = Image.fromarray(mask_np, mode="L")
+
     logger.info(
         "mask_selected strategy=%s mask_size=%s quality_score=%s",
         mask_meta["mask_type_used"],
@@ -676,17 +737,37 @@ def run_idm_vton_inference(
 
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
-    prompt = "model is wearing " + garment_desc
-    negative_prompt = (
-        "monochrome, lowres, bad anatomy, worst quality, low quality, "
-        "deformed, distorted, disfigured, bad proportions, "
-        "extra limbs, missing limbs, cloned head, body out of frame, "
-        "poorly drawn face, mutation, mutated, extra fingers, "
-        "ugly, blurry, watermark, signature, text, logo, "
-        "beard on woman, mustache on woman, masculine face on woman, "
-        "feminine face on man, changed hairstyle, changed hair color, "
-        "changed skin tone, changed body shape, gender swap"
-    )
+    if cloth_type == "lower_body":
+        prompt = (
+            "photo of a person wearing " + garment_desc + ", "
+            "upper body unchanged, original shirt, same torso, same arms, "
+            "realistic fabric texture, natural clothing folds"
+        )
+        negative_prompt = (
+            "monochrome, lowres, bad anatomy, worst quality, low quality, "
+            "deformed, distorted, disfigured, bad proportions, "
+            "extra limbs, missing limbs, cloned head, body out of frame, "
+            "poorly drawn face, mutation, mutated, extra fingers, "
+            "ugly, blurry, watermark, signature, text, logo, "
+            "beard on woman, mustache on woman, masculine face on woman, "
+            "feminine face on man, changed hairstyle, changed hair color, "
+            "changed skin tone, changed body shape, gender swap, "
+            "changed shirt, new shirt, different top, altered torso, "
+            "regenerated upper body, different arms, moved hands, "
+            "changed shoulders, modified chest, new upper garment"
+        )
+    else:
+        prompt = "model is wearing " + garment_desc
+        negative_prompt = (
+            "monochrome, lowres, bad anatomy, worst quality, low quality, "
+            "deformed, distorted, disfigured, bad proportions, "
+            "extra limbs, missing limbs, cloned head, body out of frame, "
+            "poorly drawn face, mutation, mutated, extra fingers, "
+            "ugly, blurry, watermark, signature, text, logo, "
+            "beard on woman, mustache on woman, masculine face on woman, "
+            "feminine face on man, changed hairstyle, changed hair color, "
+            "changed skin tone, changed body shape, gender swap"
+        )
 
     with torch.inference_mode():
         with _maybe_autocast():
@@ -733,7 +814,46 @@ def run_idm_vton_inference(
     if auto_crop and crop_size is not None:
         out_img = images[0].resize(crop_size)
         final_img = human_img_orig.copy()
-        final_img.paste(out_img, (int(left), int(top)))
+
+        # Edge-aware feathering: blend the crop output with the original
+        # at the crop boundary to avoid visible seams
+        crop_w, crop_h = crop_size
+        feather_px = max(12, min(crop_w, crop_h) // 20)
+
+        # Build 1D feathering ramps for each edge
+        alpha = np.ones((crop_h, crop_w), dtype=np.float32)
+
+        # Top edge fade (only if not at image top)
+        if int(top) > 0:
+            ramp = np.linspace(0.0, 1.0, feather_px)
+            alpha[:feather_px, :] *= ramp[:, np.newaxis]
+
+        # Bottom edge fade (only if not at image bottom)
+        orig_bottom = int(top) + crop_h
+        if orig_bottom < height:
+            ramp = np.linspace(1.0, 0.0, feather_px)
+            alpha[-feather_px:, :] *= ramp[:, np.newaxis]
+
+        # Left edge fade (only if not at image left)
+        if int(left) > 0:
+            ramp = np.linspace(0.0, 1.0, feather_px)
+            alpha[:, :feather_px] *= ramp[np.newaxis, :]
+
+        # Right edge fade (only if not at image right)
+        orig_right = int(left) + crop_w
+        if orig_right < width:
+            ramp = np.linspace(1.0, 0.0, feather_px)
+            alpha[:, -feather_px:] *= ramp[np.newaxis, :]
+
+        # Alpha composite: output * alpha + original * (1 - alpha)
+        out_np = np.array(out_img.convert("RGB"), dtype=np.float32)
+        orig_crop = np.array(
+            human_img_orig.crop((int(left), int(top), orig_right, orig_bottom))
+            .resize((crop_w, crop_h)),
+            dtype=np.float32,
+        )
+        blended = (out_np * alpha[..., np.newaxis] + orig_crop * (1.0 - alpha[..., np.newaxis])).astype(np.uint8)
+        final_img.paste(Image.fromarray(blended), (int(left), int(top)))
         return final_img, mask_meta
 
     return images[0], mask_meta
@@ -748,6 +868,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         WorkerMaskStrategy,
         detect_inference_failures,
     )
+    from quality_validation import validate_output_quality
 
     job_start = time.perf_counter()
 
@@ -925,6 +1046,24 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         torch.cuda.synchronize()
     inference_ms = (time.perf_counter() - inference_start) * 1000
 
+    # ── Quality validation for lower_body ──────────────────────────────
+    geometry_report = None
+    if vton_type == "lower_body" and result is not None:
+        geometry_report = validate_output_quality(
+            person_img,
+            result,
+            external_mask if external_mask is not None else Image.fromarray(
+                np.zeros((TARGET_H, TARGET_W), dtype=np.uint8), mode="L"
+            ),
+            vton_type,
+            garment_img,
+        )
+        if not geometry_report["passed"]:
+            logger.warning(
+                "lower_body_quality_check_failed reasons=%s",
+                geometry_report["reasons"],
+            )
+
     # ── Color fidelity: computed via detect_inference_failures with garment_ref ──
     # CRITICAL: We pass garment_img as garment_ref so the metric compares the
     #           SOURCE GARMENT against the OUTPUT, not the original person's
@@ -978,6 +1117,15 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "color_drift_mean_rgb": result_color_drift,
         "garment_mean_rgb": round(garm_mean_all, 1),
         "guidance_scale_used": round(effective_guidance, 2),
+        "upper_body_preservation": (
+            geometry_report["upper_body_preservation"] if geometry_report else None
+        ),
+        "fabric_texture": (
+            geometry_report["fabric_texture"] if geometry_report else None
+        ),
+        "geometry_score": (
+            geometry_report["geometry_score"] if geometry_report else None
+        ),
         "trace_id": trace_id,
     }
 

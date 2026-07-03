@@ -7,14 +7,393 @@ Runs on RunPod where SCHP, OpenPose, and DensePose are available.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from typing import FrozenSet, Optional
 
 import cv2
 import numpy as np
 from PIL import Image
 
 logger = logging.getLogger("idm-vton.worker.mask")
+
+
+# ── SCHP Label Constants ─────────────────────────────────────────────────────
+
+_LABEL_SKIRT = 5
+_LABEL_PANTS = 6
+_LABEL_UPPER_CLOTHES = 4
+_LABEL_LEFT_ARM = 14
+_LABEL_RIGHT_ARM = 15
+_LABEL_LEFT_LEG = 12
+_LABEL_RIGHT_LEG = 13
+
+# ── Clothing label sets per cloth_type ────────────────────────────────────────
+
+_CLOTHING_LABELS: dict[str, frozenset[int]] = {
+    "upper_body": frozenset({_LABEL_UPPER_CLOTHES}),
+    "lower_body": frozenset({_LABEL_PANTS, _LABEL_SKIRT}),
+    "dresses": frozenset({_LABEL_UPPER_CLOTHES, _LABEL_PANTS, _LABEL_SKIRT}),
+}
+
+
+# ── GarmentProfile dataclass ─────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class GarmentProfile:
+    """Structured understanding of a target garment for mask building."""
+    family: str  # "upper", "lower", "full"
+    cloth_type: str  # "upper_body", "lower_body", "dresses"
+    covers_upper: bool
+    covers_lower: bool
+    covers_arms: bool
+    covers_hands: bool
+    covers_torso_full: bool
+    has_sleeves: bool
+    is_fitted: bool
+
+
+# ── GARMENT_PROFILES: canonical garment subtypes ─────────────────────────────
+
+GARMENT_PROFILES: dict[str, GarmentProfile] = {
+    # Upper body
+    "shirt": GarmentProfile("upper", "upper_body", True, False, True, True, False, True, False),
+    "tshirt": GarmentProfile("upper", "upper_body", True, False, True, True, False, True, False),
+    "t_shirt": GarmentProfile("upper", "upper_body", True, False, True, True, False, True, False),
+    "hoodie": GarmentProfile("upper", "upper_body", True, False, True, True, False, True, False),
+    "jacket": GarmentProfile("upper", "upper_body", True, False, True, True, False, True, False),
+    "kurta": GarmentProfile("upper", "upper_body", True, False, True, True, False, True, False),
+    "blazer": GarmentProfile("upper", "upper_body", True, False, True, True, False, True, False),
+    "sweater": GarmentProfile("upper", "upper_body", True, False, True, True, False, True, False),
+    "tank_top": GarmentProfile("upper", "upper_body", True, False, False, True, False, False, False),
+    # Lower body
+    "jeans": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, True),
+    "trousers": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, True),
+    "pants": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, True),
+    "shorts": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, False),
+    "skirt": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, True),
+    "mini_skirt": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, True),
+    "long_skirt": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, True),
+    "leggings": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, True),
+    "joggers": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, False),
+    "wide_leg": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, False),
+    "palazzo": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, False),
+    "cargo_pants": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, False),
+    "chinos": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, True),
+    "bermuda": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, False),
+    "maxi_skirt": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, False),
+    # Dresses / full body
+    "dress": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "gown": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "saree": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "lehenga": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "jumpsuit": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "kurta_set": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "overall": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "bodysuit": GarmentProfile("full", "dresses", True, True, True, True, True, True, True),
+}
+
+
+# ── GarmentGeometry: mask expansion properties ────────────────────────────────
+
+@dataclass(frozen=True)
+class GarmentGeometry:
+    """Geometric expansion properties for mask building."""
+    body_region: str  # "upper", "lower", "full"
+    protect_upper: bool = False
+    protect_lower: bool = False
+    expansion_width: int = 10
+    expansion_down: int = 20
+
+
+GARMENT_GEOMETRY: dict[str, GarmentGeometry] = {
+    # Upper body
+    "shirt": GarmentGeometry("upper"),
+    "tshirt": GarmentGeometry("upper"),
+    "t_shirt": GarmentGeometry("upper"),
+    "hoodie": GarmentGeometry("upper", expansion_width=15),
+    "jacket": GarmentGeometry("upper", expansion_width=20),
+    "kurta": GarmentGeometry("upper"),
+    # Lower body
+    "jeans": GarmentGeometry("lower", protect_upper=True),
+    "trousers": GarmentGeometry("lower", protect_upper=True),
+    "pants": GarmentGeometry("lower", protect_upper=True),
+    "shorts": GarmentGeometry("lower", protect_upper=True, expansion_down=10),
+    "skirt": GarmentGeometry("lower", protect_upper=True),
+    "mini_skirt": GarmentGeometry("lower", protect_upper=True, expansion_down=10),
+    "long_skirt": GarmentGeometry("lower", protect_upper=True, expansion_down=30),
+    "leggings": GarmentGeometry("lower", protect_upper=True, expansion_width=5),
+    "joggers": GarmentGeometry("lower", protect_upper=True, expansion_width=15),
+    "wide_leg": GarmentGeometry("lower", protect_upper=True, expansion_width=30),
+    "palazzo": GarmentGeometry("lower", protect_upper=True, expansion_width=60),
+    "cargo_pants": GarmentGeometry("lower", protect_upper=True, expansion_width=20),
+    "chinos": GarmentGeometry("lower", protect_upper=True),
+    "bermuda": GarmentGeometry("lower", protect_upper=True, expansion_down=10),
+    "maxi_skirt": GarmentGeometry("lower", protect_upper=True, expansion_down=120),
+    # Dresses
+    "dress": GarmentGeometry("full"),
+    "gown": GarmentGeometry("full", expansion_down=60),
+}
+
+
+# ── EDITABLE_BODY_REGIONS: which SCHP labels are inpaintable ─────────────────
+
+EDITABLE_BODY_REGIONS: dict[str, frozenset[int]] = {
+    "upper_body": frozenset({_LABEL_UPPER_CLOTHES, _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM}),
+    "lower_body": frozenset({_LABEL_PANTS, _LABEL_SKIRT, _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}),
+    "dresses": frozenset({
+        _LABEL_UPPER_CLOTHES, _LABEL_PANTS, _LABEL_SKIRT,
+        _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM,
+        _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG,
+    }),
+}
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+_FAMILY_LOWER: frozenset[str] = frozenset({
+    "jeans", "trousers", "pants", "shorts", "skirt", "mini_skirt",
+    "long_skirt", "leggings", "joggers", "wide_leg", "palazzo",
+    "cargo_pants", "chinos", "bermuda", "maxi_skirt",
+})
+
+
+def get_garment_family(subtype: str) -> str:
+    """Classify a garment subtype into its family."""
+    if subtype in _FAMILY_LOWER:
+        return "lower"
+    profile = GARMENT_PROFILES.get(subtype)
+    if profile:
+        return profile.family
+    return "upper"
+
+
+def build_garment_profile(
+    garment_subtype: str,
+    cloth_type: str,
+    garment_img_info: dict | None = None,
+) -> GarmentProfile:
+    """Build a structured understanding of the target garment."""
+    # Try exact match first
+    profile = GARMENT_PROFILES.get(garment_subtype)
+    if profile:
+        return profile
+
+    # Fallback: build from cloth_type
+    if cloth_type == "lower_body":
+        return GarmentProfile(
+            family="lower", cloth_type="lower_body",
+            covers_upper=False, covers_lower=True, covers_arms=False,
+            covers_hands=False, covers_torso_full=False,
+            has_sleeves=False, is_fitted=True,
+        )
+    if cloth_type == "dresses":
+        return GarmentProfile(
+            family="full", cloth_type="dresses",
+            covers_upper=True, covers_lower=True, covers_arms=True,
+            covers_hands=True, covers_torso_full=True,
+            has_sleeves=True, is_fitted=False,
+        )
+    return GarmentProfile(
+        family="upper", cloth_type="upper_body",
+        covers_upper=True, covers_lower=False, covers_arms=True,
+        covers_hands=True, covers_torso_full=False,
+        has_sleeves=True, is_fitted=False,
+    )
+
+
+def get_garment_geometry(subtype: str) -> GarmentGeometry:
+    """Look up geometric expansion properties for mask building."""
+    geo = GARMENT_GEOMETRY.get(subtype)
+    if geo:
+        return geo
+    # Fallback based on family
+    family = get_garment_family(subtype)
+    if family == "lower":
+        return GarmentGeometry("lower", protect_upper=True)
+    if family == "full":
+        return GarmentGeometry("full")
+    return GarmentGeometry("upper")
+
+
+def get_profile_editable_labels(profile: GarmentProfile) -> frozenset[int]:
+    """Get the set of SCHP labels that are inpaintable for this profile."""
+    if profile.covers_lower:
+        return {_LABEL_PANTS, _LABEL_SKIRT, _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
+    if profile.covers_upper:
+        return {_LABEL_UPPER_CLOTHES, _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM}
+    return frozenset()
+
+
+def detect_source_cloth_type(schp_np: np.ndarray) -> str:
+    """Detect what the person is currently wearing from SCHP pixel ratios."""
+    h, w = schp_np.shape[:2]
+    total_px = h * w
+
+    garment_labels = {
+        _LABEL_UPPER_CLOTHES, _LABEL_PANTS, _LABEL_SKIRT,
+        _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM,
+        _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG,
+    }
+    garment_px = int(np.sum(np.isin(schp_np, list(garment_labels))))
+    if garment_px == 0:
+        return "unknown"
+
+    garment_ratio = garment_px / total_px
+
+    upper_px = int(np.sum(schp_np == _LABEL_UPPER_CLOTHES))
+    pants_px = int(np.sum(schp_np == _LABEL_PANTS))
+    skirt_px = int(np.sum(schp_np == _LABEL_SKIRT))
+    lower_px = pants_px + skirt_px
+
+    # Detection priority: Lower body if pants/skirt dominate
+    if lower_px / garment_ratio > 0.40:
+        return "lower_body"
+
+    # Pre-upper catch: pants/skirt >= upper
+    if lower_px >= upper_px:
+        return "lower_body"
+
+    if upper_px > 0:
+        return "upper_body"
+
+    return "unknown"
+
+
+def build_schp_inpaint_mask(
+    schp_labels: np.ndarray,
+    cloth_type: str,
+    garment_subtype: str,
+    source_cloth_type: str,
+    profile: GarmentProfile,
+) -> np.ndarray:
+    """Build binary inpaint mask from SCHP labels + GarmentProfile."""
+    target_labels = EDITABLE_BODY_REGIONS.get(cloth_type, set())
+
+    same_category = (
+        (source_cloth_type == cloth_type)
+        or (source_cloth_type == "unknown")
+    )
+
+    if same_category:
+        source_labels = _CLOTHING_LABELS.get(source_cloth_type, set())
+        mask = np.isin(schp_labels, list(source_labels)).astype(np.uint8) * 255
+        mask = np.maximum(
+            mask,
+            np.isin(schp_labels, list(target_labels)).astype(np.uint8) * 255,
+        )
+    else:
+        # Cross-category: target body region + source garment for erasure
+        mask = np.isin(schp_labels, list(target_labels)).astype(np.uint8) * 255
+        source_labels = _CLOTHING_LABELS.get(source_cloth_type, set())
+        if source_labels:
+            mask = np.maximum(
+                mask,
+                np.isin(schp_labels, list(source_labels)).astype(np.uint8) * 255,
+            )
+
+    return mask
+
+
+def build_schp_protect_mask(
+    schp_labels: np.ndarray,
+    cloth_type: str,
+    profile: GarmentProfile,
+) -> np.ndarray:
+    """Build protect mask — regions that must NOT be inpainted."""
+    editable = get_profile_editable_labels(profile)
+    identity_labels = {0, 1, 2, 3, 16, 17, 18}  # background, hat, hair, sunglasses, socks, shoes, accessories
+    protect_labels = identity_labels | editable
+    # Protect everything NOT in the editable set
+    all_labels = set(range(20))
+    non_editable = all_labels - editable - identity_labels
+    protect_mask = np.isin(schp_labels, list(non_editable)).astype(np.uint8) * 255
+    return protect_mask
+
+
+def build_final_inpaint_mask(
+    schp_labels: np.ndarray,
+    cloth_type: str,
+    garment_subtype: str,
+    source_cloth_type: str,
+    garment_img_info: dict | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build final mask triplet: (final_mask, inpaint_mask, protect_mask).
+
+    Returns:
+        final_mask_np: Combined mask for inference (uint8, 768x1024)
+        inpaint_mask_np: Regions to inpaint (uint8, 768x1024)
+        protect_mask_np: Regions to protect (uint8, 768x1024)
+    """
+    profile = build_garment_profile(garment_subtype, cloth_type, garment_img_info)
+
+    inpaint_mask = build_schp_inpaint_mask(
+        schp_labels, cloth_type, garment_subtype, source_cloth_type, profile,
+    )
+
+    protect_mask = build_schp_protect_mask(schp_labels, cloth_type, profile)
+
+    # Apply protect: zero out protected regions from inpaint
+    final_mask = inpaint_mask.copy()
+    final_mask[protect_mask > 127] = 0
+
+    # Boundary smoothing: cloth-type-specific dilation kernel
+    if cloth_type in ("lower_body", "dresses", "full_body"):
+        # Moderate vertical kernel — enough to cover leg edges without bleeding
+        # into the torso. Single iteration keeps the mask tight at the waist.
+        leg_kw = max(3, int(5 * 2.0))
+        leg_kh = max(5, int(7 * 2.0))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (leg_kw, leg_kh))
+        inpaint_dilated = cv2.dilate(final_mask, kernel, iterations=1)
+
+        # Hard upper-body exclusion: for lower_body, nothing above the waist
+        # should be inpainted. Use the top row of inpaint pixels as the
+        # boundary — any dilation above that line is unwanted.
+        if cloth_type == "lower_body":
+            rows_with_mask = np.where(inpaint_dilated.any(axis=1))[0]
+            if len(rows_with_mask) > 0:
+                mask_top = int(rows_with_mask[0])
+                # Allow 8px feathering zone above the mask top for smooth transition
+                exclude_top = max(0, mask_top - 8)
+                inpaint_dilated[:exclude_top, :] = 0
+    else:
+        # upper_body: wider horizontal kernel
+        up_kw = max(7, int(10 * 2.5))
+        up_kh = max(5, int(6 * 2.5))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (up_kw, up_kh))
+        inpaint_dilated = cv2.dilate(final_mask, kernel, iterations=1)
+
+    return inpaint_dilated, inpaint_mask, protect_mask
+
+
+def validate_mask_coverage(
+    mask: Image.Image,
+    cloth_type: str,
+) -> dict[str, object]:
+    """Pre-inference mask sanity check."""
+    binary = np.array(mask.convert("L"), dtype=np.uint8)
+    h, w = binary.shape[:2]
+    total = h * w
+    if total == 0:
+        return {"valid": False, "reason": "empty_mask"}
+
+    coverage = float(np.sum(binary > 127)) / total
+
+    if cloth_type in ("lower_body", "dresses", "full_body"):
+        lower_zone = binary[h * 3 // 5:, :]
+        lower_coverage = float(np.sum(lower_zone > 127)) / lower_zone.size
+        if lower_coverage < 0.03:
+            return {
+                "valid": False,
+                "coverage_percent": round(coverage * 100, 1),
+                "reason": f"lower_body_too_sparse:{lower_coverage*100:.1f}%",
+            }
+
+    return {"valid": True, "coverage_percent": round(coverage * 100, 1)}
+
+
+# ── Existing pipeline code ───────────────────────────────────────────────────
 
 
 class WorkerMaskStrategy(str, Enum):
