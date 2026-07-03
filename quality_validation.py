@@ -136,6 +136,38 @@ def _upper_body_preservation_score(
     return score
 
 
+def _face_quality_score(
+    person: Image.Image,
+    result: Image.Image,
+) -> float:
+    """
+    Verify face identity is preserved.
+
+    Compares the top 22% of the image (face band) between person and result.
+    Any significant drift indicates face regeneration or identity loss.
+
+    Returns score 0..100 (higher = better face preservation).
+    """
+    orig = np.array(person.convert("RGB"), dtype=np.float32)
+    out = np.array(result.convert("RGB"), dtype=np.float32)
+
+    if orig.shape != out.shape:
+        out = np.array(result.convert("RGB").resize(person.size, Image.LANCZOS), dtype=np.float32)
+
+    h = orig.shape[0]
+    face_band = slice(0, int(0.22 * h), None)
+
+    orig_face = orig[face_band]
+    out_face = out[face_band]
+
+    diff = np.mean(np.abs(orig_face - out_face), axis=2)
+    mean_diff = float(np.mean(diff))
+
+    # Score: 0 drift = 100, 25+ drift = 0
+    score = max(0.0, 100.0 - (mean_diff / 25.0) * 100.0)
+    return score
+
+
 def _fabric_texture_score(
     result: Image.Image,
     mask_np: np.ndarray,
@@ -208,6 +240,11 @@ def validate_output_quality(
     if cloth_type == "lower_body" and upper_preservation < 60.0:
         reasons.append(f"upper_body_drift:{upper_preservation:.0f}")
 
+    # Face identity preservation
+    face_score = _face_quality_score(person, result)
+    if face_score < 50.0:
+        reasons.append(f"face_identity_drift:{face_score:.0f}")
+
     # Fabric texture realism
     fabric_texture = _fabric_texture_score(result, mask_np)
     if fabric_texture < 30.0:
@@ -216,6 +253,7 @@ def validate_output_quality(
     return {
         "geometry_score": round(geometry_score, 2),
         "upper_body_preservation": round(upper_preservation, 1),
+        "face_quality": round(face_score, 1),
         "fabric_texture": round(fabric_texture, 1),
         "passed": len(reasons) == 0,
         "reasons": reasons,

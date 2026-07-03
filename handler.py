@@ -563,11 +563,253 @@ def _maybe_autocast():
     return _NullCtx()
 
 
+# =============================================================================
+# Subtype-aware prompt attributes (lower-body only)
+# =============================================================================
+
+_GARMENT_PROMPT_ATTRS: dict[str, dict[str, str]] = {
+    "jeans": {
+        "coverage": "lower body garment",
+        "fit": "regular fit",
+        "silhouette": "straight leg",
+        "sleeves": "n/a",
+        "neckline": "n/a",
+        "collar": "n/a",
+        "waist_position": "natural waist or hip",
+        "garment_length": "full length to ankle",
+        "layering": "single layer",
+        "structure": "denim two legs button fly",
+        "drape": "minimal drape",
+        "material": "denim cotton twill",
+        "fabric_behavior": "stiff structured",
+    },
+    "trousers": {
+        "coverage": "lower body garment",
+        "fit": "regular fit",
+        "silhouette": "straight leg",
+        "sleeves": "n/a",
+        "neckline": "n/a",
+        "collar": "n/a",
+        "waist_position": "natural waist",
+        "garment_length": "full length to ankle",
+        "layering": "single layer",
+        "structure": "two legs zip fly",
+        "drape": "moderate drape",
+        "material": "woven cotton polyester",
+        "fabric_behavior": "smooth structured",
+    },
+    "pants": {
+        "coverage": "lower body garment",
+        "fit": "regular fit",
+        "silhouette": "straight leg",
+        "sleeves": "n/a",
+        "neckline": "n/a",
+        "collar": "n/a",
+        "waist_position": "natural waist or hip",
+        "garment_length": "full length to ankle",
+        "layering": "single layer",
+        "structure": "two legs",
+        "drape": "moderate drape",
+        "material": "woven cotton",
+        "fabric_behavior": "smooth structured",
+    },
+    "shorts": {
+        "coverage": "lower body garment",
+        "fit": "regular fit",
+        "silhouette": "straight leg",
+        "sleeves": "n/a",
+        "neckline": "n/a",
+        "collar": "n/a",
+        "waist_position": "natural waist or hip",
+        "garment_length": "above knee",
+        "layering": "single layer",
+        "structure": "two legs",
+        "drape": "minimal drape",
+        "material": "cotton twill",
+        "fabric_behavior": "casual structured",
+    },
+    "skirt": {
+        "coverage": "lower body garment",
+        "fit": "regular fit",
+        "silhouette": "A-line",
+        "sleeves": "n/a",
+        "neckline": "n/a",
+        "collar": "n/a",
+        "waist_position": "natural waist",
+        "garment_length": "varies",
+        "layering": "single layer",
+        "structure": "no leg separation",
+        "drape": "flowing drape",
+        "material": "woven cotton",
+        "fabric_behavior": "soft flowing",
+    },
+    "joggers": {
+        "coverage": "lower body garment",
+        "fit": "relaxed fit",
+        "silhouette": "tapered leg",
+        "sleeves": "n/a",
+        "neckline": "n/a",
+        "collar": "n/a",
+        "waist_position": "elastic waist",
+        "garment_length": "full length to ankle",
+        "layering": "single layer",
+        "structure": "two legs elastic cuff",
+        "drape": "soft drape",
+        "material": "fleece cotton jersey",
+        "fabric_behavior": "soft relaxed",
+    },
+    "leggings": {
+        "coverage": "lower body garment",
+        "fit": "tight fitted",
+        "silhouette": "body-hugging",
+        "sleeves": "n/a",
+        "neckline": "n/a",
+        "collar": "n/a",
+        "waist_position": "high waist",
+        "garment_length": "full length to ankle",
+        "layering": "single layer",
+        "structure": "two legs no fly",
+        "drape": "no drape skin-tight",
+        "material": "stretch jersey",
+        "fabric_behavior": "stretch conforming",
+    },
+    "cargo_pants": {
+        "coverage": "lower body garment",
+        "fit": "relaxed fit",
+        "silhouette": "straight leg",
+        "sleeves": "n/a",
+        "neckline": "n/a",
+        "collar": "n/a",
+        "waist_position": "natural waist or hip",
+        "garment_length": "full length to ankle",
+        "layering": "single layer",
+        "structure": "pocketed utility",
+        "drape": "moderate drape",
+        "material": "cotton twill",
+        "fabric_behavior": "rugged structured",
+    },
+    "chinos": {
+        "coverage": "lower body garment",
+        "fit": "regular fit",
+        "silhouette": "straight leg",
+        "sleeves": "n/a",
+        "neckline": "n/a",
+        "collar": "n/a",
+        "waist_position": "natural waist",
+        "garment_length": "full length to ankle",
+        "layering": "single layer",
+        "structure": "two legs zip fly",
+        "drape": "moderate drape",
+        "material": "cotton chino",
+        "fabric_behavior": "smooth structured",
+    },
+    "wide_leg": {
+        "coverage": "lower body garment",
+        "fit": "relaxed fit",
+        "silhouette": "wide leg",
+        "sleeves": "n/a",
+        "neckline": "n/a",
+        "collar": "n/a",
+        "waist_position": "natural waist",
+        "garment_length": "full length to ankle",
+        "layering": "single layer",
+        "structure": "two legs wide",
+        "drape": "flowing drape",
+        "material": "woven cotton",
+        "fabric_behavior": "flowing structured",
+    },
+    "palazzo": {
+        "coverage": "lower body garment",
+        "fit": "relaxed fit",
+        "silhouette": "extremely wide leg",
+        "sleeves": "n/a",
+        "neckline": "n/a",
+        "collar": "n/a",
+        "waist_position": "natural waist",
+        "garment_length": "full length to ankle",
+        "layering": "single layer",
+        "structure": "two legs very wide",
+        "drape": "heavy flowing drape",
+        "material": "flowing woven",
+        "fabric_behavior": "flowing soft",
+    },
+    "bermuda": {
+        "coverage": "lower body garment",
+        "fit": "regular fit",
+        "silhouette": "straight leg",
+        "sleeves": "n/a",
+        "neckline": "n/a",
+        "collar": "n/a",
+        "waist_position": "natural waist or hip",
+        "garment_length": "above knee to knee",
+        "layering": "single layer",
+        "structure": "two legs",
+        "drape": "minimal drape",
+        "material": "cotton twill",
+        "fabric_behavior": "casual structured",
+    },
+}
+
+
+def _build_subtype_aware_prompt(garment_desc: str, garment_subtype: str = "") -> str:
+    """
+    Build a detailed prompt enriched with subtype-specific garment attributes.
+
+    For lower-body garments, appends fabric, fit, silhouette, and structure
+    details that guide the diffusion model toward realistic generation.
+
+    For upper-body or unknown subtypes, returns the basic prompt unchanged.
+    """
+    key = (garment_subtype or "").strip().lower().replace(" ", "_").replace("-", "_")
+    attrs = _GARMENT_PROMPT_ATTRS.get(key)
+    if not attrs:
+        return "model is wearing " + garment_desc
+
+    parts = ["model wearing " + garment_desc]
+    for attr_key in (
+        "coverage", "fit", "silhouette", "sleeves", "neckline",
+        "collar", "waist_position", "garment_length", "layering",
+        "structure", "drape", "material", "fabric_behavior",
+    ):
+        if attr_key in attrs:
+            parts.append(attrs[attr_key])
+    return ", ".join(parts)
+
+
+def _build_source_specific_negative(source_cloth_type: str = "", target_subtype: str = "") -> str:
+    """
+    Build a negative prompt that suppresses accessories, artifacts, and
+    unrealistic rendering styles.
+
+    Does NOT include task-specific terms (e.g., no "shirt, top" for lower-body)
+    — those are handled by the positive prompt's preservation instructions.
+    """
+    return (
+        "monochrome, lowres, bad anatomy, worst quality, low quality, "
+        "deformed, distorted, disfigured, bad proportions, "
+        "extra limbs, missing limbs, cloned head, body out of frame, "
+        "poorly drawn face, mutation, mutated, extra fingers, "
+        "ugly, blurry, watermark, signature, text, logo, "
+        "smooth plastic, airbrushed, cg render, 3d render, "
+        "flat lighting, "
+        "bag, purse, handbag, clutch, tote, backpack, "
+        "headphones, earphones, headset, "
+        "necklace, chain, pendant, choker, "
+        "watch, wristwatch, bracelet, "
+        "sunglasses, eyewear, glasses, "
+        "phone, smartphone, mobile, "
+        "strap, belt, waist belt, "
+        "accessory, accessories, "
+        "extra object, held item, carrying"
+    )
+
+
 def run_idm_vton_inference(
     person_img: Image.Image,
     garment_img: Image.Image,
     garment_desc: str,
     cloth_type: str,
+    garment_subtype: str = "",
     steps: int = 30,
     seed: int = 42,
     auto_crop: bool = True,
@@ -738,36 +980,15 @@ def run_idm_vton_inference(
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
     if cloth_type == "lower_body":
-        prompt = (
-            "photo of a person wearing " + garment_desc + ", "
-            "upper body unchanged, original shirt, same torso, same arms, "
-            "realistic fabric texture, natural clothing folds"
-        )
-        negative_prompt = (
-            "monochrome, lowres, bad anatomy, worst quality, low quality, "
-            "deformed, distorted, disfigured, bad proportions, "
-            "extra limbs, missing limbs, cloned head, body out of frame, "
-            "poorly drawn face, mutation, mutated, extra fingers, "
-            "ugly, blurry, watermark, signature, text, logo, "
-            "beard on woman, mustache on woman, masculine face on woman, "
-            "feminine face on man, changed hairstyle, changed hair color, "
-            "changed skin tone, changed body shape, gender swap, "
-            "changed shirt, new shirt, different top, altered torso, "
+        prompt = _build_subtype_aware_prompt(garment_desc, garment_subtype)
+        negative_prompt = _build_source_specific_negative() + (
+            ", changed shirt, new shirt, different top, altered torso, "
             "regenerated upper body, different arms, moved hands, "
             "changed shoulders, modified chest, new upper garment"
         )
     else:
         prompt = "model is wearing " + garment_desc
-        negative_prompt = (
-            "monochrome, lowres, bad anatomy, worst quality, low quality, "
-            "deformed, distorted, disfigured, bad proportions, "
-            "extra limbs, missing limbs, cloned head, body out of frame, "
-            "poorly drawn face, mutation, mutated, extra fingers, "
-            "ugly, blurry, watermark, signature, text, logo, "
-            "beard on woman, mustache on woman, masculine face on woman, "
-            "feminine face on man, changed hairstyle, changed hair color, "
-            "changed skin tone, changed body shape, gender swap"
-        )
+        negative_prompt = _build_source_specific_negative()
 
     with torch.inference_mode():
         with _maybe_autocast():
@@ -877,6 +1098,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     mask_image_ref = job_input.get("mask_image") or job_input.get("mask_image_url")
     protected_ref = job_input.get("protected_mask") or job_input.get("protected_mask_url")
     garment_desc = job_input.get("garment_desc") or job_input.get("garment_description") or "garment"
+    garment_subtype = job_input.get("garment_subtype", "")
     cloth_type = job_input.get("cloth_type", "upper_body")
     steps = int(job_input.get("steps", DENOISE_STEPS))
     seed = int(job_input.get("seed", random.randint(0, 2**31 - 1)))
@@ -994,6 +1216,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             garment_img=garment_img,
             garment_desc=garment_desc,
             cloth_type=vton_type,
+            garment_subtype=garment_subtype,
             steps=steps,
             seed=seed + attempt_idx,
             auto_crop=True,
