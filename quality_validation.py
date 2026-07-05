@@ -87,12 +87,18 @@ def _garment_geometry_score(
             score += 0.15
 
     elif target_cloth_type == "dresses":
-        # Dresses: should span > 50% vertically
+        # Dresses: should span > 50% vertically, top-anchored (neckline near top)
         if vertical_span > 0.5:
             score += 0.2
         if 0.2 < centroid_y < 0.8:
             score += 0.15
         if x_max - x_min > 0.15:
+            score += 0.15
+        # Top-anchoring: neckline should be near the top of the image
+        if y_min < 0.15:
+            score += 0.15
+        # Full coverage: dress should extend to bottom 20%
+        if y_max > 0.75:
             score += 0.15
 
     return min(score, 1.0)

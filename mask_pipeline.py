@@ -20,20 +20,33 @@ logger = logging.getLogger("idm-vton.worker.mask")
 
 # ── SCHP Label Constants ─────────────────────────────────────────────────────
 
+_LABEL_BG = 0
+_LABEL_HAT = 1
+_LABEL_HAIR = 2
+_LABEL_SUNGLASSES = 3
+_LABEL_UPPER_CLOTHES = 4
 _LABEL_SKIRT = 5
 _LABEL_PANTS = 6
-_LABEL_UPPER_CLOTHES = 4
-_LABEL_LEFT_ARM = 14
-_LABEL_RIGHT_ARM = 15
+_LABEL_DRESS = 7
+_LABEL_BELT = 8
+_LABEL_LEFT_SHOE = 9
+_LABEL_RIGHT_SHOE = 10
+_LABEL_FACE = 11
 _LABEL_LEFT_LEG = 12
 _LABEL_RIGHT_LEG = 13
+_LABEL_LEFT_ARM = 14
+_LABEL_RIGHT_ARM = 15
+_LABEL_BAG = 16
+_LABEL_SCARF = 17
+_LABEL_NECK = 18
 
 # ── Clothing label sets per cloth_type ────────────────────────────────────────
 
 _CLOTHING_LABELS: dict[str, frozenset[int]] = {
     "upper_body": frozenset({_LABEL_UPPER_CLOTHES}),
     "lower_body": frozenset({_LABEL_PANTS, _LABEL_SKIRT}),
-    "dresses": frozenset({_LABEL_UPPER_CLOTHES, _LABEL_PANTS, _LABEL_SKIRT}),
+    "dresses": frozenset({_LABEL_UPPER_CLOTHES, _LABEL_PANTS, _LABEL_SKIRT,
+                          _LABEL_DRESS, _LABEL_SCARF}),
 }
 
 
@@ -218,10 +231,18 @@ def get_garment_geometry(subtype: str) -> GarmentGeometry:
 
 def get_profile_editable_labels(profile: GarmentProfile) -> frozenset[int]:
     """Get the set of SCHP labels that are inpaintable for this profile."""
+    # Full-body garments (dresses, jumpsuits, co-ord sets): everything
+    # clothing-related is editable — upper clothes, lower clothes, arms, legs
+    if profile.covers_upper and profile.covers_lower:
+        return frozenset({
+            _LABEL_UPPER_CLOTHES, _LABEL_PANTS, _LABEL_SKIRT,
+            _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM,
+            _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG,
+        })
     if profile.covers_lower:
-        return {_LABEL_PANTS, _LABEL_SKIRT, _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}
+        return frozenset({_LABEL_PANTS, _LABEL_SKIRT, _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG})
     if profile.covers_upper:
-        return {_LABEL_UPPER_CLOTHES, _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM}
+        return frozenset({_LABEL_UPPER_CLOTHES, _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM})
     return frozenset()
 
 
@@ -302,7 +323,17 @@ def build_schp_protect_mask(
 ) -> np.ndarray:
     """Build protect mask — regions that must NOT be inpainted."""
     editable = get_profile_editable_labels(profile)
-    identity_labels = {0, 1, 2, 3, 16, 17, 18}  # background, hat, hair, sunglasses, socks, shoes, accessories
+
+    # Identity labels that are ALWAYS protected (face, head, background)
+    identity_labels = {_LABEL_BG, _LABEL_HAT, _LABEL_HAIR, _LABEL_SUNGLASSES,
+                       _LABEL_FACE, _LABEL_NECK}
+
+    # For full-body garments, socks/shoes/belt/scarf are part of the outfit
+    # and should NOT be identity-protected. For upper/lower-only, protect them.
+    if not (profile.covers_upper and profile.covers_lower):
+        identity_labels |= {_LABEL_BELT, _LABEL_LEFT_SHOE, _LABEL_RIGHT_SHOE,
+                            _LABEL_BAG, _LABEL_SCARF}
+
     protect_labels = identity_labels | editable
     # Protect everything NOT in the editable set
     all_labels = set(range(20))
@@ -339,24 +370,29 @@ def build_final_inpaint_mask(
     final_mask[protect_mask > 127] = 0
 
     # Boundary smoothing: cloth-type-specific dilation kernel
-    if cloth_type in ("lower_body", "dresses", "full_body"):
-        # Moderate vertical kernel — enough to cover leg edges without bleeding
-        # into the torso. Single iteration keeps the mask tight at the waist.
+    if cloth_type in ("dresses", "full_body"):
+        # Dresses/full-body: larger vertical kernel to cover full garment
+        # boundary from neckline to hem. Two iterations for sufficient
+        # coverage of flowing silhouettes (gowns, kurtis, jumpsuits).
+        dress_kw = max(3, int(19 * 1.0))
+        dress_kh = max(5, int(29 * 1.0))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dress_kw, dress_kh))
+        inpaint_dilated = cv2.dilate(final_mask, kernel, iterations=2)
+    elif cloth_type == "lower_body":
+        # Lower body: moderate vertical kernel — covers leg edges without
+        # bleeding into the torso. Single iteration keeps the mask tight.
         leg_kw = max(3, int(5 * 2.0))
         leg_kh = max(5, int(7 * 2.0))
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (leg_kw, leg_kh))
         inpaint_dilated = cv2.dilate(final_mask, kernel, iterations=1)
 
-        # Hard upper-body exclusion: for lower_body, nothing above the waist
-        # should be inpainted. Use the top row of inpaint pixels as the
-        # boundary — any dilation above that line is unwanted.
-        if cloth_type == "lower_body":
-            rows_with_mask = np.where(inpaint_dilated.any(axis=1))[0]
-            if len(rows_with_mask) > 0:
-                mask_top = int(rows_with_mask[0])
-                # Allow 8px feathering zone above the mask top for smooth transition
-                exclude_top = max(0, mask_top - 8)
-                inpaint_dilated[:exclude_top, :] = 0
+        # Hard upper-body exclusion: nothing above the waist should be
+        # inpainted. Use the top row of inpaint pixels as the boundary.
+        rows_with_mask = np.where(inpaint_dilated.any(axis=1))[0]
+        if len(rows_with_mask) > 0:
+            mask_top = int(rows_with_mask[0])
+            exclude_top = max(0, mask_top - 8)
+            inpaint_dilated[:exclude_top, :] = 0
     else:
         # upper_body: wider horizontal kernel
         up_kw = max(7, int(10 * 2.5))

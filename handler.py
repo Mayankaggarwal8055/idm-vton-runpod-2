@@ -748,6 +748,97 @@ _GARMENT_PROMPT_ATTRS: dict[str, dict[str, str]] = {
         "material": "cotton twill",
         "fabric_behavior": "casual structured",
     },
+    # ── Dress / full-body garments ──────────────────────────────────
+    "dress": {
+        "coverage": "full body garment",
+        "fit": "regular fit",
+        "silhouette": "fitted bodice flared skirt",
+        "sleeves": "varies",
+        "neckline": "varies",
+        "collar": "n/a",
+        "waist_position": "natural waist",
+        "garment_length": "knee length or longer",
+        "layering": "single layer",
+        "structure": "one-piece bodice and skirt",
+        "drape": "moderate drape",
+        "material": "woven cotton polyester",
+        "fabric_behavior": "structured flowing",
+    },
+    "gown": {
+        "coverage": "full body garment",
+        "fit": "regular fit",
+        "silhouette": "floor length elegant",
+        "sleeves": "varies",
+        "neckline": "varies",
+        "collar": "n/a",
+        "waist_position": "natural waist",
+        "garment_length": "floor length",
+        "layering": "single layer",
+        "structure": "one-piece full length",
+        "drape": "heavy flowing drape",
+        "material": "silk satin chiffon",
+        "fabric_behavior": "flowing elegant",
+    },
+    "jumpsuit": {
+        "coverage": "full body garment",
+        "fit": "regular fit",
+        "silhouette": "continuous torso to legs",
+        "sleeves": "varies",
+        "neckline": "varies",
+        "collar": "n/a",
+        "waist_position": "natural waist",
+        "garment_length": "full length to ankle",
+        "layering": "single layer",
+        "structure": "one-piece with leg separation",
+        "drape": "moderate drape",
+        "material": "woven cotton polyester",
+        "fabric_behavior": "structured fitted",
+    },
+    "kurti": {
+        "coverage": "full body garment",
+        "fit": "regular fit",
+        "silhouette": "tunic over pants",
+        "sleeves": "varies",
+        "neckline": "round or v-neck",
+        "collar": "n/a",
+        "waist_position": "natural waist",
+        "garment_length": "hip to knee length",
+        "layering": "layered with bottoms",
+        "structure": "tunic top with separate bottoms",
+        "drape": "moderate drape",
+        "material": "cotton silk",
+        "fabric_behavior": "soft flowing",
+    },
+    "coord": {
+        "coverage": "full body outfit",
+        "fit": "regular fit",
+        "silhouette": "matching top and bottom",
+        "sleeves": "varies",
+        "neckline": "varies",
+        "collar": "varies",
+        "waist_position": "natural waist",
+        "garment_length": "varies by set",
+        "layering": "coordinated set",
+        "structure": "matching top and bottom pieces",
+        "drape": "moderate drape",
+        "material": "matching fabric set",
+        "fabric_behavior": "coordinated structured",
+    },
+    "overall": {
+        "coverage": "full body garment",
+        "fit": "relaxed fit",
+        "silhouette": "one-piece bib front",
+        "sleeves": "sleeveless or with shirt",
+        "neckline": "bib front",
+        "collar": "n/a",
+        "waist_position": "natural waist",
+        "garment_length": "full length to ankle",
+        "layering": "over shirt",
+        "structure": "bib and brace with legs",
+        "drape": "minimal drape",
+        "material": "denim cotton twill",
+        "fabric_behavior": "rugged structured",
+    },
 }
 
 
@@ -950,6 +1041,35 @@ def run_idm_vton_inference(
 
         mask = Image.fromarray(mask_np, mode="L")
 
+    # Dress/full-body silhouette enhancement: AND mask with garment silhouette
+    # clipped to ALL editable body labels (clothing + arms + legs)
+    if cloth_type in ("dresses", "full_body"):
+        from mask_pipeline import EDITABLE_BODY_REGIONS
+        _target_labels = EDITABLE_BODY_REGIONS.get("dresses", set())
+
+        garm_gray = np.array(garm_img.convert("L"), dtype=np.uint8)
+        _, garm_silhouette_mask = cv2.threshold(garm_gray, 240, 255, cv2.THRESH_BINARY_INV)
+
+        _schp_body = np.isin(model_parse, list(_target_labels)).astype(np.uint8) * 255
+        _schp_body = cv2.resize(_schp_body, (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        _clipped = np.minimum(garm_silhouette_mask, _schp_body)
+
+        # Geometric fallback: if AND removed too much, use all clothing labels
+        silhouette_px = int(np.sum(garm_silhouette_mask > 127))
+        clipped_px = int(np.sum(_clipped > 127))
+        if silhouette_px > 0 and clipped_px < silhouette_px * 0.75:
+            _all_body = np.isin(model_parse, list(range(1, 17))).astype(np.uint8) * 255
+            _all_body = cv2.resize(_all_body, (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+            _clipped = np.minimum(garm_silhouette_mask, _all_body)
+            close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            _clipped = cv2.morphologyEx(_clipped, cv2.MORPH_CLOSE, close_kernel)
+            logger.info("dress_geometric_fallback silhouette_px=%d clipped_px=%d", silhouette_px, clipped_px)
+
+        mask_np = np.array(mask.convert("L"), dtype=np.uint8)
+        mask_np = np.maximum(mask_np, _clipped)
+        mask = Image.fromarray(mask_np, mode="L")
+
     logger.info(
         "mask_selected strategy=%s mask_size=%s quality_score=%s",
         mask_meta["mask_type_used"],
@@ -979,13 +1099,21 @@ def run_idm_vton_inference(
 
     effective_guidance = guidance_scale if guidance_scale is not None else GUIDANCE_SCALE
 
-    if cloth_type == "lower_body":
+    if cloth_type in ("lower_body", "dresses", "full_body"):
         prompt = _build_subtype_aware_prompt(garment_desc, garment_subtype)
-        negative_prompt = _build_source_specific_negative() + (
-            ", changed shirt, new shirt, different top, altered torso, "
-            "regenerated upper body, different arms, moved hands, "
-            "changed shoulders, modified chest, new upper garment"
-        )
+        if cloth_type == "lower_body":
+            negative_prompt = _build_source_specific_negative() + (
+                ", changed shirt, new shirt, different top, altered torso, "
+                "regenerated upper body, different arms, moved hands, "
+                "changed shoulders, modified chest, new upper garment"
+            )
+        else:
+            # dresses / full_body: suppress common failure modes
+            negative_prompt = _build_source_specific_negative() + (
+                ", changed garment category, wrong outfit type, "
+                "mini dress, different silhouette, wrong length, "
+                "missing sleeves, changed sleeve style, wrong neckline"
+            )
     else:
         prompt = "model is wearing " + garment_desc
         negative_prompt = _build_source_specific_negative()
@@ -1085,30 +1213,26 @@ def run_idm_vton_inference(
 # =============================================================================
 
 def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
-    from mask_pipeline import (
-        WorkerMaskStrategy,
-        detect_inference_failures,
-    )
+    """
+    Direct inference — no preprocessing service.
+
+    Downloads raw person + garment images, resizes to target size,
+    and runs IDM-VTON with the model's built-in AutoMasker for mask
+    generation. No external masks, no protected regions, no preprocessing
+    pipeline.
+    """
     from quality_validation import validate_output_quality
 
     job_start = time.perf_counter()
 
     person_url = job_input.get("person_image_url") or job_input.get("person_image")
     garment_url = job_input.get("garment_image_url") or job_input.get("garment_image")
-    mask_image_ref = job_input.get("mask_image") or job_input.get("mask_image_url")
-    protected_ref = job_input.get("protected_mask") or job_input.get("protected_mask_url")
     garment_desc = job_input.get("garment_desc") or job_input.get("garment_description") or "garment"
     garment_subtype = job_input.get("garment_subtype", "")
     cloth_type = job_input.get("cloth_type", "upper_body")
     steps = int(job_input.get("steps", DENOISE_STEPS))
     seed = int(job_input.get("seed", random.randint(0, 2**31 - 1)))
-    mask_quality_score = job_input.get("mask_quality_score")
-    if mask_quality_score is not None:
-        mask_quality_score = float(mask_quality_score)
-    mask_strategy_hint = str(job_input.get("mask_strategy", "auto"))
     trace_id = job_input.get("trace_id", "")
-    max_retries = int(os.environ.get("MASK_WORKER_MAX_RETRIES", "2"))
-    retry_enabled = os.environ.get("MASK_WORKER_RETRY", "1") == "1"
 
     if not person_url or not garment_url:
         raise ValueError("Missing required inputs: person_image_url and garment_image_url")
@@ -1125,9 +1249,6 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     }
     vton_type = cloth_type_map.get(cloth_type, "upper_body")
 
-    import numpy as np
-
-    # Color-preserving garment description — include color from preprocessing
     garment_desc = garment_desc.strip()
     if garment_desc.lower().startswith(("a ", "an ", "the ")):
         garment_desc = garment_desc[garment_desc.index(" ") + 1:].strip()
@@ -1137,172 +1258,58 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         vton_type, steps, seed, garment_desc, trace_id,
     )
 
-    # ── Garment RGB diagnostics (after download below) ────────────────
-
+    # ── Download raw images ──
     download_start = time.perf_counter()
     person_img = download_image(person_url)
     garment_img = download_image(garment_url)
-
-    external_mask = None
-    if mask_image_ref:
-        try:
-            external_mask_img = load_image_reference(str(mask_image_ref))
-            external_mask = external_mask_img.convert("L").resize(TARGET_SIZE)
-            logger.info(
-                "external_mask_loaded source=%s mask_size=%s quality_score=%s",
-                "url" if _is_url_reference(str(mask_image_ref)) else "base64",
-                external_mask.size,
-                mask_quality_score,
-            )
-        except Exception as exc:
-            logger.warning(
-                "external_mask_load_failed error=%s falling_back_to_automasker",
-                exc,
-            )
-
-    protected_mask = None
-    if protected_ref:
-        try:
-            protected_mask = load_image_reference(str(protected_ref)).convert("L")
-            logger.info("protected_mask_loaded size=%s", protected_mask.size)
-        except Exception as exc:
-            logger.warning("protected_mask_load_failed error=%s", exc)
-
     download_ms = (time.perf_counter() - download_start) * 1000
 
-    # ── Garment RGB diagnostics (must run AFTER garment_img is downloaded) ─
+    # ── Garment RGB diagnostics ──
     garm_np = np.array(garment_img.convert("RGB"), dtype=np.float32)
-    garm_mean_r = float(np.mean(garm_np[:, :, 0]))
-    garm_mean_g = float(np.mean(garm_np[:, :, 1]))
-    garm_mean_b = float(np.mean(garm_np[:, :, 2]))
-    garm_mean_all = (garm_mean_r + garm_mean_g + garm_mean_b) / 3.0
-    garm_is_dark = garm_mean_all < 80.0
+    garm_mean_all = float(np.mean(garm_np))
     logger.info(
-        "garment_rgb_stats mean_r=%.1f mean_g=%.1f mean_b=%.1f mean_all=%.1f is_dark=%s",
-        garm_mean_r, garm_mean_g, garm_mean_b, garm_mean_all, garm_is_dark,
+        "garment_rgb_stats mean_all=%.1f is_dark=%s",
+        garm_mean_all, garm_mean_all < 80.0,
     )
 
-    # Retry strategies: external/automasker → automasker → hybrid
-    retry_strategies: list[str] = []
-    if external_mask and mask_strategy_hint not in ("automasker",):
-        retry_strategies.append("external")
-    retry_strategies.append("automasker")
-    if external_mask:
-        retry_strategies.append("hybrid")
-    if not retry_enabled:
-        retry_strategies = retry_strategies[:1]
-
-    inference_start = time.perf_counter()
-    result: Image.Image | None = None
-    mask_meta: dict[str, object] = {}
-    quality_report = None
-    retry_count = 0
-    failure_reasons: list[str] = []
-    last_inpaint_mask = external_mask
-
-    # Detect dark garment — reduce guidance to prevent color drift
+    # ── Direct inference — always use AutoMasker, no preprocessing ──
     effective_guidance = GUIDANCE_SCALE
     if garm_mean_all < 80.0:
-        effective_guidance = GUIDANCE_SCALE * 0.75  # Reduce guidance for dark garments
-        logger.info(
-            "dark_garment_detected mean=%.1f reducing_guidance from %.1f to %.1f",
-            garm_mean_all, GUIDANCE_SCALE, effective_guidance,
-        )
+        effective_guidance = GUIDANCE_SCALE * 0.75
 
-    for attempt_idx, strategy in enumerate(retry_strategies[: max_retries + 1]):
-        retry_count = attempt_idx
-        result, mask_meta = run_idm_vton_inference(
-            person_img=person_img,
-            garment_img=garment_img,
-            garment_desc=garment_desc,
-            cloth_type=vton_type,
-            garment_subtype=garment_subtype,
-            steps=steps,
-            seed=seed + attempt_idx,
-            auto_crop=True,
-            external_mask=external_mask,
-            protected_mask=protected_mask,
-            mask_strategy=strategy,
-            mask_quality_score=mask_quality_score,
-            guidance_scale=effective_guidance,
-        )
-        last_inpaint_mask = external_mask if strategy == "external" else None
-
-        if not retry_enabled or attempt_idx >= len(retry_strategies) - 1:
-            break
-
-        inpaint_for_qa = external_mask if strategy == "external" else None
-        if inpaint_for_qa is None:
-            break
-
-        quality_report = detect_inference_failures(
-            person_img.resize(TARGET_SIZE),
-            result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
-            inpaint_for_qa,
-            protected_mask,
-            garment_ref=garment_img,  # CRITICAL: pass garment source for TRUE color comparison
-        )
-
-        # Color-driven retry: if color fidelity is low, retry
-        color_passed = True
-        if quality_report.color_fidelity_score < 50.0:
-            color_passed = False
-            logger.warning(
-                "color_fidelity_low attempt=%s score=%.1f garm_mean=%.1f retrying",
-                attempt_idx, quality_report.color_fidelity_score, garm_mean_all,
-            )
-
-        if quality_report.passed and color_passed:
-            break
-
-        failure_reasons = list(quality_report.failure_reasons)
-        if not color_passed:
-            failure_reasons.append(f"color_fidelity:{quality_report.color_fidelity_score:.0f}")
-        logger.warning(
-            "inference_qa_failed attempt=%s strategy=%s reasons=%s retrying",
-            attempt_idx,
-            strategy,
-            failure_reasons,
-        )
+    inference_start = time.perf_counter()
+    result, mask_meta = run_idm_vton_inference(
+        person_img=person_img,
+        garment_img=garment_img,
+        garment_desc=garment_desc,
+        cloth_type=vton_type,
+        garment_subtype=garment_subtype,
+        steps=steps,
+        seed=seed,
+        auto_crop=True,
+        external_mask=None,
+        protected_mask=None,
+        mask_strategy="automasker",
+        mask_quality_score=None,
+        guidance_scale=effective_guidance,
+    )
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     inference_ms = (time.perf_counter() - inference_start) * 1000
 
-    # ── Quality validation for lower_body ──────────────────────────────
+    # ── Quality validation ──
     geometry_report = None
-    if vton_type == "lower_body" and result is not None:
+    if result is not None:
         geometry_report = validate_output_quality(
             person_img,
             result,
-            external_mask if external_mask is not None else Image.fromarray(
-                np.zeros((TARGET_H, TARGET_W), dtype=np.uint8), mode="L"
-            ),
+            Image.fromarray(np.zeros((TARGET_H, TARGET_W), dtype=np.uint8), mode="L"),
             vton_type,
             garment_img,
         )
         if not geometry_report["passed"]:
-            logger.warning(
-                "lower_body_quality_check_failed reasons=%s",
-                geometry_report["reasons"],
-            )
-
-    # ── Color fidelity: computed via detect_inference_failures with garment_ref ──
-    # CRITICAL: We pass garment_img as garment_ref so the metric compares the
-    #           SOURCE GARMENT against the OUTPUT, not the original person's
-    #           clothing against the output (which would be backwards).
-    result_color_fidelity = quality_report.color_fidelity_score if quality_report else None
-    result_color_drift = quality_report.color_drift_mean_rgb if quality_report else None
-    if result_color_fidelity is None and result is not None and external_mask is not None:
-        qa = detect_inference_failures(
-            person_img.resize(TARGET_SIZE),
-            result.resize(TARGET_SIZE) if result.size != TARGET_SIZE else result,
-            external_mask,
-            protected_mask,
-            garment_ref=garment_img,
-        )
-        result_color_fidelity = qa.color_fidelity_score
-        result_color_drift = qa.color_drift_mean_rgb
+            logger.warning("quality_check_failed reasons=%s", geometry_report["reasons"])
 
     upload_start = time.perf_counter()
     result_url = _upload_to_cloudinary(result, job_id)
@@ -1312,10 +1319,9 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     logger.info(
         "job_complete total_ms=%.0f download_ms=%.0f inference_ms=%.0f upload_ms=%.0f "
-        "mask_type=%s retry_count=%s trace_id=%s",
+        "mask_type=%s trace_id=%s",
         total_ms, download_ms, inference_ms, upload_ms,
         mask_meta.get("mask_type_used"),
-        retry_count,
         trace_id,
     )
 
@@ -1330,25 +1336,6 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "download_ms": round(download_ms, 2),
         "total_ms": round(total_ms, 2),
         "mask_type_used": mask_meta.get("mask_type_used"),
-        "mask_quality_score": mask_quality_score,
-        "retry_count": retry_count,
-        "failure_reasons": failure_reasons or None,
-        "identity_drift_score": (
-            quality_report.identity_drift_score if quality_report else None
-        ),
-        "color_fidelity_score": result_color_fidelity,
-        "color_drift_mean_rgb": result_color_drift,
-        "garment_mean_rgb": round(garm_mean_all, 1),
-        "guidance_scale_used": round(effective_guidance, 2),
-        "upper_body_preservation": (
-            geometry_report["upper_body_preservation"] if geometry_report else None
-        ),
-        "fabric_texture": (
-            geometry_report["fabric_texture"] if geometry_report else None
-        ),
-        "geometry_score": (
-            geometry_report["geometry_score"] if geometry_report else None
-        ),
         "trace_id": trace_id,
     }
 
