@@ -27,4 +27,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: mayankaggarwal8055/idm-vton-runpod:v50
+          tags: mayankaggarwal8055/idm-vton-runpod:v53

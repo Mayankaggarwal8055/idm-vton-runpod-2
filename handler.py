@@ -997,7 +997,6 @@ def run_idm_vton_inference(
     if cloth_type == "lower_body":
         from mask_pipeline import (
             EDITABLE_BODY_REGIONS,
-            _LABEL_PANTS, _LABEL_SKIRT, _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG,
         )
         _target_labels = EDITABLE_BODY_REGIONS.get("lower_body", set())
 
@@ -1017,9 +1016,11 @@ def run_idm_vton_inference(
         silhouette_px = int(np.sum(garm_silhouette_mask > 127))
         clipped_px = int(np.sum(_clipped > 127))
         if silhouette_px > 0 and clipped_px < silhouette_px * 0.75:
-            # Geometric fallback: SCHP misclassified legs as upper_clothes
-            # Use dilated all-body mask instead
-            _all_body = np.isin(model_parse, list(range(1, 17))).astype(np.uint8) * 255
+            # Geometric fallback: SCHP misclassified pants as upper_clothes
+            # Use all body labels EXCLUDING legs to preserve leg geometry
+            from mask_pipeline import _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG
+            _fallback_labels = [l for l in range(1, 17) if l not in (_LABEL_LEFT_LEG, _LABEL_RIGHT_LEG)]
+            _all_body = np.isin(model_parse, _fallback_labels).astype(np.uint8) * 255
             _all_body = cv2.resize(_all_body, (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
             _clipped = np.minimum(garm_silhouette_mask, _all_body)
             # Morphological closing to fill holes from jeans
@@ -1169,13 +1170,21 @@ def run_idm_vton_inference(
         crop_w, crop_h = crop_size
         feather_px = max(12, min(crop_w, crop_h) // 20)
 
+        # For lower-body/full-body: extend top-edge feathering to cover the
+        # face band (top ~22% of crop). The diffusion model can slightly
+        # drift face identity even when protected — restoring from the
+        # original at the top edge eliminates this without affecting garment
+        # quality in the lower body where it matters.
+        is_lower_or_full = cloth_type in ("lower_body", "dresses", "full_body")
+        top_feather = min(crop_h // 3, int(0.22 * crop_h)) if is_lower_or_full else feather_px
+
         # Build 1D feathering ramps for each edge
         alpha = np.ones((crop_h, crop_w), dtype=np.float32)
 
         # Top edge fade (only if not at image top)
         if int(top) > 0:
-            ramp = np.linspace(0.0, 1.0, feather_px)
-            alpha[:feather_px, :] *= ramp[:, np.newaxis]
+            ramp = np.linspace(0.0, 1.0, top_feather)
+            alpha[:top_feather, :] *= ramp[:, np.newaxis]
 
         # Bottom edge fade (only if not at image bottom)
         orig_bottom = int(top) + crop_h

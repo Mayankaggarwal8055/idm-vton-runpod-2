@@ -153,7 +153,7 @@ GARMENT_GEOMETRY: dict[str, GarmentGeometry] = {
 
 EDITABLE_BODY_REGIONS: dict[str, frozenset[int]] = {
     "upper_body": frozenset({_LABEL_UPPER_CLOTHES, _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM}),
-    "lower_body": frozenset({_LABEL_PANTS, _LABEL_SKIRT, _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG}),
+    "lower_body": frozenset({_LABEL_PANTS, _LABEL_SKIRT}),
     "dresses": frozenset({
         _LABEL_UPPER_CLOTHES, _LABEL_PANTS, _LABEL_SKIRT,
         _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM,
@@ -240,7 +240,7 @@ def get_profile_editable_labels(profile: GarmentProfile) -> frozenset[int]:
             _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG,
         })
     if profile.covers_lower:
-        return frozenset({_LABEL_PANTS, _LABEL_SKIRT, _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG})
+        return frozenset({_LABEL_PANTS, _LABEL_SKIRT})
     if profile.covers_upper:
         return frozenset({_LABEL_UPPER_CLOTHES, _LABEL_LEFT_ARM, _LABEL_RIGHT_ARM})
     return frozenset()
