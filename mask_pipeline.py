@@ -381,8 +381,8 @@ def build_final_inpaint_mask(
     elif cloth_type == "lower_body":
         # Lower body: moderate vertical kernel — covers leg edges without
         # bleeding into the torso. Single iteration keeps the mask tight.
-        leg_kw = max(3, int(5 * 2.0))
-        leg_kh = max(5, int(7 * 2.0))
+        leg_kw = max(3, int(4 * 2.0))
+        leg_kh = max(5, int(6 * 2.0))
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (leg_kw, leg_kh))
         inpaint_dilated = cv2.dilate(final_mask, kernel, iterations=1)
 
@@ -391,7 +391,8 @@ def build_final_inpaint_mask(
         rows_with_mask = np.where(inpaint_dilated.any(axis=1))[0]
         if len(rows_with_mask) > 0:
             mask_top = int(rows_with_mask[0])
-            exclude_top = max(0, mask_top - 8)
+            # 20px margin preserves the waistband region for natural fit.
+            exclude_top = max(0, mask_top - 20)
             inpaint_dilated[:exclude_top, :] = 0
     else:
         # upper_body: wider horizontal kernel

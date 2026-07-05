@@ -895,6 +895,92 @@ def _build_source_specific_negative(source_cloth_type: str = "", target_subtype:
     )
 
 
+def _restore_person_identity(
+    result: Image.Image,
+    original: Image.Image,
+    cloth_type: str,
+) -> Image.Image:
+    """
+    Hard-composite the person's face and upper identity from the original
+    onto the diffusion result.
+
+    The IDM-VTON model with strength=1.0 denoises the entire image,
+    regenerating the face even though it's not in the inpaint mask.
+    This function restores the person's identity by detecting the face
+    in the original and blending it back with a soft mask.
+
+    For dresses/full-body: restore face + hair + neck + upper chest.
+    For lower_body: restore face + hair + neck + shoulders + upper torso.
+    """
+    import cv2
+
+    orig_np = np.array(original.convert("RGB"), dtype=np.float32)
+    result_np = np.array(result.convert("RGB"), dtype=np.float32)
+    h, w = orig_np.shape[:2]
+
+    if orig_np.shape != result_np.shape:
+        result_np = np.array(
+            result.convert("RGB").resize(original.size, Image.LANCZOS),
+            dtype=np.float32,
+        )
+
+    # Detect face in original using OpenCV Haar cascade
+    orig_uint8 = np.array(original.convert("RGB"), dtype=np.uint8)
+    gray = cv2.cvtColor(orig_uint8, cv2.COLOR_RGB2GRAY)
+    cascade_path = os.path.join(
+        cv2.data.haarcascades, "haarcascade_frontalface_default.xml"
+    )
+    detector = cv2.CascadeClassifier(cascade_path)
+    if detector.empty():
+        return result
+
+    min_dim = max(30, int(min(h, w) * 0.04))
+    faces = detector.detectMultiScale(
+        gray, scaleFactor=1.1, minNeighbors=5, minSize=(min_dim, min_dim)
+    )
+    if len(faces) == 0:
+        return result
+
+    # Take the largest face
+    (fx, fy, fw, fh) = max(faces, key=lambda r: r[2] * r[3])
+
+    # Build identity region mask: face + generous margins for hair, jawline, neck
+    # Top: extends into hair (40% above face box)
+    # Bottom: extends into neck/upper chest (60% below face box)
+    # Sides: extends to include ears (15% wider each side)
+    pad_x = int(fw * 0.15)
+    pad_y_top = int(fh * 0.40)  # hair
+    pad_y_bottom = int(fh * 0.60)  # neck + upper chest
+
+    face_x1 = max(0, fx - pad_x)
+    face_y1 = max(0, fy - pad_y_top)
+    face_x2 = min(w, fx + fw + pad_x)
+    face_y2 = min(h, fy + fh + pad_y_bottom)
+
+    # Create soft-edged mask using distance transform for smooth blending
+    mask_region = np.zeros((h, w), dtype=np.uint8)
+    mask_region[face_y1:face_y2, face_x1:face_x2] = 255
+
+    # Erode then blur for soft edges (feather ~15px)
+    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask_eroded = cv2.erode(mask_region, erode_k, iterations=2)
+    blur_size = max(15, min(fw, fh) // 8)
+    if blur_size % 2 == 0:
+        blur_size += 1
+    mask_soft = cv2.GaussianBlur(mask_eroded.astype(np.float32), (blur_size, blur_size), 0)
+    mask_3d = mask_soft[:, :, np.newaxis] / 255.0
+
+    # Composite: result * (1 - mask) + original * mask
+    restored = (result_np * (1.0 - mask_3d) + orig_np * mask_3d).astype(np.uint8)
+
+    logger.info(
+        "face_identity_restored face_box=(%d,%d,%d,%d) region=(%d,%d,%d,%d) blur=%d",
+        fx, fy, fw, fh, face_x1, face_y1, face_x2, face_y2, blur_size,
+    )
+
+    return Image.fromarray(restored, mode="RGB")
+
+
 def run_idm_vton_inference(
     person_img: Image.Image,
     garment_img: Image.Image,
@@ -1004,6 +1090,12 @@ def run_idm_vton_inference(
         garm_gray = np.array(garm_img.convert("L"), dtype=np.uint8)
         _, garm_silhouette_mask = cv2.threshold(garm_gray, 240, 255, cv2.THRESH_BINARY_INV)
 
+        # Exclude face/hair from garment silhouette to prevent identity bleed
+        _face_hair_labels = {2, 11}  # _LABEL_HAIR, _LABEL_FACE
+        _schp_exclude = np.isin(model_parse, list(_face_hair_labels)).astype(np.uint8) * 255
+        _schp_exclude = cv2.resize(_schp_exclude, (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+        garm_silhouette_mask[_schp_exclude > 127] = 0
+
         # Get SCHP body region labels — model_parse is at half-res (512x384),
         # upsample to match garm_silhouette_mask (1024x768)
         _schp_body = np.isin(model_parse, list(_target_labels)).astype(np.uint8) * 255
@@ -1012,10 +1104,10 @@ def run_idm_vton_inference(
         # AND: only keep silhouette pixels that overlap with body region
         _clipped = np.minimum(garm_silhouette_mask, _schp_body)
 
-        # Check if AND removed too much (>25% of silhouette pixels)
+        # Check if AND removed too much (>40% of silhouette pixels)
         silhouette_px = int(np.sum(garm_silhouette_mask > 127))
         clipped_px = int(np.sum(_clipped > 127))
-        if silhouette_px > 0 and clipped_px < silhouette_px * 0.75:
+        if silhouette_px > 0 and clipped_px < silhouette_px * 0.60:
             # Geometric fallback: SCHP misclassified pants as upper_clothes
             # Use all body labels EXCLUDING legs to preserve leg geometry
             from mask_pipeline import _LABEL_LEFT_LEG, _LABEL_RIGHT_LEG
@@ -1028,6 +1120,10 @@ def run_idm_vton_inference(
             _clipped = cv2.morphologyEx(_clipped, cv2.MORPH_CLOSE, close_kernel)
             logger.info("lower_body_geometric_fallback silhouette_px=%d clipped_px=%d", silhouette_px, clipped_px)
 
+        # Light dilation to preserve garment shape and prevent mask erosion
+        _dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        _clipped = cv2.dilate(_clipped, _dilate_k, iterations=1)
+
         # Merge enhanced silhouette into mask
         mask_np = np.array(mask.convert("L"), dtype=np.uint8)
         mask_np = np.maximum(mask_np, _clipped)
@@ -1037,7 +1133,9 @@ def run_idm_vton_inference(
         rows_with_mask = np.where(mask_np.any(axis=1))[0]
         if len(rows_with_mask) > 0:
             mask_top = int(rows_with_mask[0])
-            exclude_top = max(0, mask_top - 8)
+            # 20px margin preserves the waistband region that the diffusion
+            # model needs for natural lower-body garment placement.
+            exclude_top = max(0, mask_top - 20)
             mask_np[:exclude_top, :] = 0
 
         mask = Image.fromarray(mask_np, mode="L")
@@ -1054,12 +1152,25 @@ def run_idm_vton_inference(
         _schp_body = np.isin(model_parse, list(_target_labels)).astype(np.uint8) * 255
         _schp_body = cv2.resize(_schp_body, (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
 
+        # CRITICAL: Exclude the face region from the garment silhouette.
+        # The garment image contains the garment MODEL's body, including their
+        # face. If we don't exclude it, the model's face bleeds into the mask
+        # and the diffusion model regenerates the garment model's face instead
+        # of preserving the person's identity.
+        _face_labels = {11}  # _LABEL_FACE
+        _hair_labels = {2}   # _LABEL_HAIR
+        _exclude_labels = _face_labels | _hair_labels
+        _schp_face_hair = np.isin(model_parse, list(_exclude_labels)).astype(np.uint8) * 255
+        _schp_face_hair = cv2.resize(_schp_face_hair, (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+        # Zero out face/hair from garment silhouette
+        garm_silhouette_mask[_schp_face_hair > 127] = 0
+
         _clipped = np.minimum(garm_silhouette_mask, _schp_body)
 
         # Geometric fallback: if AND removed too much, use all clothing labels
         silhouette_px = int(np.sum(garm_silhouette_mask > 127))
         clipped_px = int(np.sum(_clipped > 127))
-        if silhouette_px > 0 and clipped_px < silhouette_px * 0.75:
+        if silhouette_px > 0 and clipped_px < silhouette_px * 0.60:
             _all_body = np.isin(model_parse, list(range(1, 17))).astype(np.uint8) * 255
             _all_body = cv2.resize(_all_body, (garm_silhouette_mask.shape[1], garm_silhouette_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
             _clipped = np.minimum(garm_silhouette_mask, _all_body)
@@ -1106,14 +1217,20 @@ def run_idm_vton_inference(
             negative_prompt = _build_source_specific_negative() + (
                 ", changed shirt, new shirt, different top, altered torso, "
                 "regenerated upper body, different arms, moved hands, "
-                "changed shoulders, modified chest, new upper garment"
+                "changed shoulders, modified chest, new upper garment, "
+                "generic pants, plain pants, lost pockets, missing seams, "
+                "lost belt loops, lost fabric detail, smooth texture, "
+                "lost garment structure, changed silhouette"
             )
         else:
-            # dresses / full_body: suppress common failure modes
+            # dresses / full_body: suppress common failure modes + identity bleed
             negative_prompt = _build_source_specific_negative() + (
                 ", changed garment category, wrong outfit type, "
                 "mini dress, different silhouette, wrong length, "
-                "missing sleeves, changed sleeve style, wrong neckline"
+                "missing sleeves, changed sleeve style, wrong neckline, "
+                "different face, new face, changed facial features, "
+                "different hair, changed hair color, different skin tone, "
+                "regenerated face, altered identity, different person"
             )
     else:
         prompt = "model is wearing " + garment_desc
@@ -1170,21 +1287,8 @@ def run_idm_vton_inference(
         crop_w, crop_h = crop_size
         feather_px = max(12, min(crop_w, crop_h) // 20)
 
-        # For lower-body/full-body: extend top-edge feathering to cover the
-        # face band (top ~22% of crop). The diffusion model can slightly
-        # drift face identity even when protected — restoring from the
-        # original at the top edge eliminates this without affecting garment
-        # quality in the lower body where it matters.
-        is_lower_or_full = cloth_type in ("lower_body", "dresses", "full_body")
-        top_feather = min(crop_h // 3, int(0.22 * crop_h)) if is_lower_or_full else feather_px
-
         # Build 1D feathering ramps for each edge
         alpha = np.ones((crop_h, crop_w), dtype=np.float32)
-
-        # Top edge fade (only if not at image top)
-        if int(top) > 0:
-            ramp = np.linspace(0.0, 1.0, top_feather)
-            alpha[:top_feather, :] *= ramp[:, np.newaxis]
 
         # Bottom edge fade (only if not at image bottom)
         orig_bottom = int(top) + crop_h
@@ -1212,6 +1316,18 @@ def run_idm_vton_inference(
         )
         blended = (out_np * alpha[..., np.newaxis] + orig_crop * (1.0 - alpha[..., np.newaxis])).astype(np.uint8)
         final_img.paste(Image.fromarray(blended), (int(left), int(top)))
+
+        # ── Face identity restoration ──────────────────────────────────
+        # The IDM-VTON model with strength=1.0 denoises the ENTIRE image,
+        # regenerating the face even though it's not in the inpaint mask.
+        # We MUST hard-composite the person's face from the original to
+        # preserve identity. This is not a heuristic — it's required for
+        # any diffusion-based try-on with strength=1.0.
+        if cloth_type in ("dresses", "full_body", "lower_body"):
+            final_img = _restore_person_identity(
+                final_img, human_img_orig, cloth_type,
+            )
+
         return final_img, mask_meta
 
     return images[0], mask_meta
@@ -1283,7 +1399,10 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     # ── Direct inference — always use AutoMasker, no preprocessing ──
     effective_guidance = GUIDANCE_SCALE
-    if garm_mean_all < 80.0:
+    # Only reduce guidance for dark UPPER-BODY garments where over-saturation
+    # is the primary failure mode. For lower-body and dresses, keep full
+    # guidance to preserve garment detail fidelity (pockets, seams, texture).
+    if garm_mean_all < 80.0 and vton_type == "upper_body":
         effective_guidance = GUIDANCE_SCALE * 0.75
 
     inference_start = time.perf_counter()
