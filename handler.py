@@ -842,6 +842,26 @@ _GARMENT_PROMPT_ATTRS: dict[str, dict[str, str]] = {
 }
 
 
+# =============================================================================
+# Fabric cues — subtype-specific texture language injected into prompts
+# =============================================================================
+
+_FABRIC_CUES: dict[str, str] = {
+    "jeans": "denim texture with visible stitching, realistic wash pattern, natural creasing at knees and hips",
+    "trousers": "woven fabric with pressed crease, smooth structured finish",
+    "pants": "woven fabric with natural drape and fold lines",
+    "shorts": "cotton twill with casual structured appearance",
+    "skirt": "flowing fabric with natural hem movement",
+    "joggers": "soft jersey fabric with gathered cuffs and elastic waist",
+    "leggings": "stretch fabric conforming to leg shape",
+    "cargo_pants": "rugged cotton twill with pocket flaps and utility stitching",
+    "wide_leg": "flowing fabric with wide silhouette and natural drape",
+    "chinos": "smooth cotton twill with clean finish",
+    "palazzo": "flowing wide-leg fabric with dramatic drape",
+    "bermuda": "casual cotton with straight hem above knee",
+}
+
+
 def _build_subtype_aware_prompt(garment_desc: str, garment_subtype: str = "") -> str:
     """
     Build a detailed prompt enriched with subtype-specific garment attributes.
@@ -849,7 +869,10 @@ def _build_subtype_aware_prompt(garment_desc: str, garment_subtype: str = "") ->
     For lower-body garments, appends fabric, fit, silhouette, and structure
     details that guide the diffusion model toward realistic generation.
 
-    For upper-body or unknown subtypes, returns the basic prompt unchanged.
+    Filters out "n/a" values (sleeves/neckline/collar for lower-body) to
+    avoid wasting prompt capacity on irrelevant attributes.
+
+    Appends fabric cues for texture-specific conditioning.
     """
     key = (garment_subtype or "").strip().lower().replace(" ", "_").replace("-", "_")
     attrs = _GARMENT_PROMPT_ATTRS.get(key)
@@ -858,12 +881,24 @@ def _build_subtype_aware_prompt(garment_desc: str, garment_subtype: str = "") ->
 
     parts = ["model wearing " + garment_desc]
     for attr_key in (
-        "coverage", "fit", "silhouette", "sleeves", "neckline",
-        "collar", "waist_position", "garment_length", "layering",
-        "structure", "drape", "material", "fabric_behavior",
+        "coverage", "fit", "silhouette", "waist_position",
+        "garment_length", "layering", "structure", "drape",
+        "material", "fabric_behavior",
     ):
-        if attr_key in attrs:
-            parts.append(attrs[attr_key])
+        val = attrs.get(attr_key, "")
+        if val and val.lower() != "n/a":
+            parts.append(val)
+
+    # Append fabric cues for texture-specific conditioning
+    fabric_cue = _FABRIC_CUES.get(key, "")
+    if fabric_cue:
+        parts.append(fabric_cue)
+
+    # Append generic texture reinforcement for lower-body
+    if key:
+        parts.append("detailed fabric texture")
+        parts.append("natural garment folds")
+
     return ", ".join(parts)
 
 
@@ -1253,6 +1288,15 @@ def run_idm_vton_inference(
             )
 
             prompt_c = "a photo of " + garment_desc
+            # Lower-body: strengthen the cloth prompt with texture cues so
+            # the garment UNet encoder receives fabric-specific conditioning.
+            if cloth_type == "lower_body":
+                _sub = (garment_subtype or "").strip().lower().replace(" ", "_")
+                _cue = _FABRIC_CUES.get(_sub, "")
+                if _cue:
+                    prompt_c = f"a photo of {garment_desc}, {_cue}"
+                else:
+                    prompt_c = f"a photo of {garment_desc}, detailed fabric texture, natural folds"
             prompt_embeds_c, _, _, _ = pipe.encode_prompt(
                 prompt_c,
                 num_images_per_prompt=1,
@@ -1285,12 +1329,45 @@ def run_idm_vton_inference(
                 guidance_scale=effective_guidance,
             )[0]
 
+    # ── Lower-body fabric enhancement (post-diffusion) ────────────────
+    # The diffusion model generates correct shape but may soften denim
+    # texture. Apply CLAHE + unsharp masked to the inpaint region to
+    # restore fabric detail without affecting identity regions.
+    if cloth_type == "lower_body":
+        _out_np = np.array(images[0].convert("RGB"), dtype=np.uint8)
+        _mask_np = np.array(mask.convert("L"), dtype=np.uint8)
+        _inpaint_bool = _mask_np > 127
+
+        if np.any(_inpaint_bool):
+            # CLAHE: adaptive histogram equalization brings out denim texture
+            _lab = cv2.cvtColor(_out_np, cv2.COLOR_RGB2LAB)
+            _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            _lab[:, :, 0] = _clahe.apply(_lab[:, :, 0])
+            _enhanced = cv2.cvtColor(_lab, cv2.COLOR_LAB2RGB)
+
+            # Unsharp mask: sharpen edges (seams, stitching) in garment region
+            _blurred = cv2.GaussianBlur(_enhanced, (0, 0), 3)
+            _sharpened = cv2.addWeighted(_enhanced, 1.5, _blurred, -0.5, 0)
+
+            # Blend: only apply within the inpaint mask, feathered at edges
+            _mask_float = _mask_np.astype(np.float32) / 255.0
+            _blur_k = max(5, min(_out_np.shape[:2]) // 100)
+            if _blur_k % 2 == 0:
+                _blur_k += 1
+            _mask_float = cv2.GaussianBlur(_mask_float, (_blur_k, _blur_k), 0)
+            _mask_3d = _mask_float[:, :, np.newaxis]
+
+            _out_float = _out_np.astype(np.float32)
+            _enh_float = _sharpened.astype(np.float32)
+            _blended = (_enh_float * _mask_3d + _out_float * (1.0 - _mask_3d)).astype(np.uint8)
+            images[0] = Image.fromarray(_blended, mode="RGB")
+
     if auto_crop and crop_size is not None:
         out_img = images[0].resize(crop_size)
         final_img = human_img_orig.copy()
 
         # Edge-aware feathering: blend the crop output with the original
-        # at the crop boundary to avoid visible seams
+        # at the crop boundary to avoid visible seams.
         crop_w, crop_h = crop_size
         feather_px = max(12, min(crop_w, crop_h) // 20)
 
@@ -1314,13 +1391,30 @@ def run_idm_vton_inference(
             ramp = np.linspace(1.0, 0.0, feather_px)
             alpha[:, -feather_px:] *= ramp[np.newaxis, :]
 
-        # Alpha composite: output * alpha + original * (1 - alpha)
+        # ── Green artifact fix: mask-aware feathering ─────────────────
+        # For lower-body, the feathering blends original person pixels at
+        # the crop boundary. If the original has green backgrounds/clothing
+        # near the boundary, those leak into the output as green artifacts.
+        # Fix: at feathering edges, compare original vs output and prefer
+        # the output (diffused) pixels when they differ significantly,
+        # preventing original background bleed.
         out_np = np.array(out_img.convert("RGB"), dtype=np.float32)
         orig_crop = np.array(
             human_img_orig.crop((int(left), int(top), orig_right, orig_bottom))
             .resize((crop_w, crop_h)),
             dtype=np.float32,
         )
+
+        if cloth_type == "lower_body":
+            # Detect "bleed zones" where original has unusual colors
+            # (green/colored background) that don't match the output
+            _diff = np.abs(out_np - orig_crop).mean(axis=2)
+            _feathered_region = alpha < 0.99
+            # Where difference is large in feathered region, force output pixels
+            # This prevents green background from bleeding through
+            _large_diff = (_diff > 25.0) & _feathered_region
+            alpha[_large_diff] = 1.0
+
         blended = (out_np * alpha[..., np.newaxis] + orig_crop * (1.0 - alpha[..., np.newaxis])).astype(np.uint8)
         final_img.paste(Image.fromarray(blended), (int(left), int(top)))
 
@@ -1362,6 +1456,25 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     garment_desc = job_input.get("garment_desc") or job_input.get("garment_description") or "garment"
     garment_subtype = job_input.get("garment_subtype", "")
     cloth_type = job_input.get("cloth_type", "upper_body")
+
+    # ── Subtype fallback: infer from garment_desc if preprocessing didn't send it ──
+    _LOWER_SUBTYPE_KEYWORDS: dict[str, list[str]] = {
+        "jeans": ["jeans", "denim"],
+        "trousers": ["trousers", "slacks"],
+        "shorts": ["shorts", "bermuda"],
+        "joggers": ["joggers", "jogger"],
+        "leggings": ["leggings", "tights"],
+        "cargo_pants": ["cargo"],
+        "wide_leg": ["wide leg", "wide-leg"],
+        "chinos": ["chinos", "chino"],
+        "skirt": ["skirt"],
+    }
+    if not garment_subtype and cloth_type in ("lower_body",):
+        _desc_lower = (garment_desc or "").lower()
+        for _sub, _kws in _LOWER_SUBTYPE_KEYWORDS.items():
+            if any(_kw in _desc_lower for _kw in _kws):
+                garment_subtype = _sub
+                break
     steps = int(job_input.get("steps", DENOISE_STEPS))
     seed = int(job_input.get("seed", random.randint(0, 2**31 - 1)))
     trace_id = job_input.get("trace_id", "")
@@ -1406,10 +1519,14 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     # ── Direct inference — always use AutoMasker, no preprocessing ──
     effective_guidance = GUIDANCE_SCALE
+    # Lower-body: boost guidance to enforce garment texture fidelity.
+    # Higher guidance = model follows garment reference more strongly,
+    # producing denim/pants material instead of generic soft fabric.
+    if vton_type == "lower_body":
+        effective_guidance = 4.0
     # Only reduce guidance for dark UPPER-BODY garments where over-saturation
-    # is the primary failure mode. For lower-body and dresses, keep full
-    # guidance to preserve garment detail fidelity (pockets, seams, texture).
-    if garm_mean_all < 80.0 and vton_type == "upper_body":
+    # is the primary failure mode. For dresses, keep full guidance.
+    elif garm_mean_all < 80.0 and vton_type == "upper_body":
         effective_guidance = GUIDANCE_SCALE * 0.75
 
     inference_start = time.perf_counter()
