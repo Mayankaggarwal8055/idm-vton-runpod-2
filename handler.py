@@ -59,6 +59,10 @@ CLOUDINARY_FOLDER = os.environ.get("CLOUDINARY_FOLDER", "trylix/tryon/results")
 
 DENOISE_STEPS = int(os.environ.get("IDM_VTON_STEPS", "30"))
 GUIDANCE_SCALE = float(os.environ.get("IDM_VTON_GUIDANCE", "2.0"))
+ENABLE_GARMENT_SILHOUETTE_MASK = os.environ.get(
+    "ENABLE_GARMENT_SILHOUETTE_MASK",
+    "0",
+) == "1"
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 TORCH_DTYPE = torch.float16
@@ -563,6 +567,52 @@ def _maybe_autocast():
     return _NullCtx()
 
 
+def _refine_target_inpaint_mask(mask: Image.Image, cloth_type: str) -> Image.Image:
+    """
+    Expand the target person's mask slightly without using the garment image as
+    geometry. The person stays the spatial authority; this only gives the model
+    enough boundary room for waistbands, hems, and drape.
+    """
+    import cv2
+
+    gt = (cloth_type or "upper_body").strip().lower().replace(" ", "_")
+    mask_np = np.array(mask.convert("L"), dtype=np.uint8)
+    mask_np = (mask_np > 127).astype(np.uint8) * 255
+
+    if gt == "lower_body":
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 17))
+        mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, close_kernel)
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 15))
+        mask_np = cv2.dilate(mask_np, dilate_kernel, iterations=1)
+
+        rows = np.where(mask_np.any(axis=1))[0]
+        if len(rows) > 0:
+            top = int(rows[0])
+            waist_top = max(0, top - 56)
+            band = mask_np[top:min(mask_np.shape[0], top + 24), :]
+            cols = np.where(np.sum(band > 127, axis=0) > 0)[0]
+            if len(cols) > 0:
+                x1 = max(0, int(cols[0]) - 20)
+                x2 = min(mask_np.shape[1], int(cols[-1]) + 20)
+                mask_np[waist_top:top, x1:x2] = 255
+            hard_protect_top = max(0, waist_top - 32)
+            mask_np[:hard_protect_top, :] = 0
+
+    elif gt in ("dresses", "full_body"):
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 21))
+        mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, close_kernel)
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 17))
+        mask_np = cv2.dilate(mask_np, dilate_kernel, iterations=1)
+
+    else:
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 11))
+        mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, close_kernel)
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 9))
+        mask_np = cv2.dilate(mask_np, dilate_kernel, iterations=1)
+
+    return Image.fromarray(mask_np, mode="L")
+
+
 # =============================================================================
 # Subtype-aware prompt attributes (lower-body only)
 # =============================================================================
@@ -809,6 +859,141 @@ _GARMENT_PROMPT_ATTRS: dict[str, dict[str, str]] = {
         "material": "cotton silk",
         "fabric_behavior": "soft flowing",
     },
+    "kurta_set": {
+        "coverage": "full body outfit",
+        "fit": "regular fit",
+        "silhouette": "long kurta over coordinated bottoms",
+        "sleeves": "varies",
+        "neckline": "round, v-neck, or mandarin placket",
+        "collar": "varies",
+        "waist_position": "natural waist covered by tunic",
+        "garment_length": "knee to calf length top with full bottoms",
+        "layering": "layered tunic and pants",
+        "structure": "separate top and bottom following body pose",
+        "drape": "soft vertical drape",
+        "material": "cotton silk rayon",
+        "fabric_behavior": "soft structured ethnic wear",
+    },
+    "saree": {
+        "coverage": "draped full body garment",
+        "fit": "wrapped drape",
+        "silhouette": "saree pleats with pallu draped over shoulder",
+        "sleeves": "blouse sleeves vary",
+        "neckline": "blouse neckline varies",
+        "collar": "n/a",
+        "waist_position": "natural waist with wrapped pleats",
+        "garment_length": "floor length drape",
+        "layering": "blouse, skirt, and pallu layers",
+        "structure": "wrapped fabric, pleats, shoulder drape",
+        "drape": "asymmetric flowing drape following body pose",
+        "material": "silk chiffon georgette cotton",
+        "fabric_behavior": "flowing folded draped fabric",
+    },
+    "lehenga": {
+        "coverage": "draped full body outfit",
+        "fit": "fitted blouse with voluminous skirt",
+        "silhouette": "flared skirt with blouse and dupatta",
+        "sleeves": "blouse sleeves vary",
+        "neckline": "blouse neckline varies",
+        "collar": "n/a",
+        "waist_position": "natural waist",
+        "garment_length": "floor length skirt",
+        "layering": "blouse, skirt, dupatta",
+        "structure": "separate blouse and flared skirt",
+        "drape": "heavy skirt drape with optional dupatta",
+        "material": "silk brocade chiffon net",
+        "fabric_behavior": "structured embellished flowing",
+    },
+    "anarkali": {
+        "coverage": "draped full body garment",
+        "fit": "fitted bodice with flared skirt",
+        "silhouette": "long flared anarkali dress",
+        "sleeves": "varies",
+        "neckline": "varies",
+        "collar": "n/a",
+        "waist_position": "high waist or natural waist",
+        "garment_length": "calf to floor length",
+        "layering": "single long tunic over bottoms",
+        "structure": "fitted upper bodice and flared lower panels",
+        "drape": "radial flowing drape",
+        "material": "cotton silk georgette",
+        "fabric_behavior": "flowing paneled fabric",
+    },
+    "abaya": {
+        "coverage": "draped full body garment",
+        "fit": "loose relaxed fit",
+        "silhouette": "long robe-like drape",
+        "sleeves": "long sleeves",
+        "neckline": "modest neckline",
+        "collar": "varies",
+        "waist_position": "loose no defined waist",
+        "garment_length": "ankle to floor length",
+        "layering": "single outer layer",
+        "structure": "robe panels following body posture",
+        "drape": "loose vertical drape",
+        "material": "crepe nida chiffon",
+        "fabric_behavior": "soft modest flowing",
+    },
+    "kaftan": {
+        "coverage": "draped full body garment",
+        "fit": "loose relaxed fit",
+        "silhouette": "wide flowing kaftan",
+        "sleeves": "wide sleeves",
+        "neckline": "varies",
+        "collar": "n/a",
+        "waist_position": "loose or belted",
+        "garment_length": "knee to floor length",
+        "layering": "single flowing layer",
+        "structure": "wide body and sleeve panels",
+        "drape": "generous flowing drape",
+        "material": "cotton silk rayon",
+        "fabric_behavior": "soft wide flowing",
+    },
+    "kimono": {
+        "coverage": "draped full body garment",
+        "fit": "wrapped relaxed fit",
+        "silhouette": "straight robe with wide sleeves",
+        "sleeves": "wide sleeves",
+        "neckline": "cross-over front",
+        "collar": "flat collar",
+        "waist_position": "belted natural waist",
+        "garment_length": "knee to ankle length",
+        "layering": "wrapped outer layer",
+        "structure": "cross-front robe panels",
+        "drape": "straight controlled drape",
+        "material": "silk satin cotton",
+        "fabric_behavior": "smooth structured drape",
+    },
+    "thobe": {
+        "coverage": "draped full body garment",
+        "fit": "straight relaxed fit",
+        "silhouette": "long straight robe",
+        "sleeves": "long sleeves",
+        "neckline": "collared or banded neckline",
+        "collar": "band or shirt collar",
+        "waist_position": "straight no defined waist",
+        "garment_length": "ankle length",
+        "layering": "single robe layer",
+        "structure": "long straight panels",
+        "drape": "clean vertical drape",
+        "material": "cotton polyester",
+        "fabric_behavior": "crisp modest drape",
+    },
+    "sherwani": {
+        "coverage": "draped full body outfit",
+        "fit": "structured tailored fit",
+        "silhouette": "long structured coat over bottoms",
+        "sleeves": "long sleeves",
+        "neckline": "mandarin collar",
+        "collar": "mandarin collar",
+        "waist_position": "natural waist or straight cut",
+        "garment_length": "knee length coat",
+        "layering": "coat over trousers",
+        "structure": "tailored long jacket with front closure",
+        "drape": "structured minimal drape",
+        "material": "brocade silk jacquard",
+        "fabric_behavior": "structured embellished formal",
+    },
     "coord": {
         "coverage": "full body outfit",
         "fit": "regular fit",
@@ -855,6 +1040,19 @@ _FABRIC_CUES: dict[str, str] = {
     "chinos": "smooth cotton twill with clean finish",
     "palazzo": "flowing wide-leg fabric with dramatic drape",
     "bermuda": "casual cotton with straight hem above knee",
+    "dress": "visible garment texture with natural skirt folds and correct hem length",
+    "gown": "flowing full-length fabric with layered folds and realistic highlights",
+    "jumpsuit": "continuous one-piece fabric with natural waist and leg creases",
+    "kurti": "embroidered or woven tunic fabric with soft vertical folds",
+    "kurta_set": "coordinated ethnic fabric with tunic folds and matching bottom drape",
+    "saree": "saree pleats, pallu shoulder drape, woven border, flowing fabric folds",
+    "lehenga": "flared skirt fabric with blouse detail, dupatta drape, visible embroidery or border",
+    "anarkali": "flared paneled fabric with radial folds and ethnic detailing",
+    "abaya": "loose robe fabric with clean vertical folds and modest flowing drape",
+    "kaftan": "wide flowing fabric with soft folds and relaxed drape",
+    "kimono": "wrapped robe fabric with smooth sleeves and cross-front fold",
+    "thobe": "crisp robe fabric with long vertical folds and clean placket",
+    "sherwani": "structured brocade or jacquard texture with front closure and formal embroidery",
 }
 
 
@@ -926,6 +1124,7 @@ def _restore_person_identity(
     result: Image.Image,
     original: Image.Image,
     cloth_type: str,
+    crop_top: int = 0,
 ) -> Image.Image:
     """
     Hard-composite the person's identity from the original onto the diffusion result.
@@ -938,6 +1137,11 @@ def _restore_person_identity(
     For lower_body: restore FULL upper body (face + hair + torso + arms + background above waist).
     For dresses/full_body: restore face + hair + neck + upper chest.
     For upper_body: restore face + hair + neck + shoulders.
+
+    Args:
+        crop_top: The Y coordinate where the auto-crop starts. Used for
+                  lower_body to align the identity restoration boundary with
+                  the actual crop boundary instead of using a heuristic.
     """
     import cv2
 
@@ -971,84 +1175,56 @@ def _restore_person_identity(
     # Take the largest face
     (fx, fy, fw, fh) = max(faces, key=lambda r: r[2] * r[3])
 
-    if cloth_type == "lower_body":
-        # ── LOWER BODY: Restore FULL upper body ──
-        # The model should only change the lower body. Everything above the
-        # waist must be preserved from the original to avoid identity drift,
-        # torso regeneration, and background mismatch.
+    if ENABLE_GARMENT_SILHOUETTE_MASK and cloth_type == "lower_body":
+        # ── LOWER BODY: Restore face + hair + neck ONLY ──
         #
-        # Strategy: Use hip line as the boundary. Restore everything above
-        # the hips with a soft blend at the waist boundary.
+        # CRITICAL FIX: The previous approach restored the ENTIRE upper body
+        # (everything above hip_y), which overwrote the model-generated
+        # waistband with the original garment pixels. This caused the
+        # "ghost jeans" artifact — the old garment appearing through the new.
         #
-        # Find the hip line from the face position (heuristic when pose is unavailable):
-        # Face is typically at ~15-25% of image height. Hips are at ~50-60%.
-        face_center_y = (fy + fh // 2)
-        face_height_ratio = face_center_y / h
+        # The model MUST be allowed to modify the torso and waistband to
+        # properly replace the old garment. We only protect the person's
+        # identity: face, hair, and neck region.
+        #
+        # Strategy: Face-centered restore mask with generous padding for hair,
+        # eroded edges for smooth blending, and NO torso restoration.
+        pad_x = int(fw * 0.25)       # wider horizontal — covers hair width
+        pad_y_top = int(fh * 0.60)   # generous upward — covers hair fully
+        pad_y_bottom = int(fh * 0.30)  # covers neck, stops before chest
 
-        # Estimate hip Y from face position: face at ~20% → hips at ~55%
-        # This is a robust heuristic for portrait photos
-        if face_height_ratio < 0.35:
-            # Face in upper third — standard portrait, hips at ~55%
-            hip_y = int(h * 0.55)
-        elif face_height_ratio < 0.5:
-            # Face in middle — full body shot, hips at ~50%
-            hip_y = int(h * 0.50)
-        else:
-            # Face in lower half — close-up, restore up to 70%
-            hip_y = int(h * 0.70)
-
-        # Add a soft margin around the hip boundary for smooth blending
-        blend_margin = max(30, int(h * 0.04))
-
-        # Build the restore mask: full upper body + soft edge at hip line
-        mask_region = np.zeros((h, w), dtype=np.uint8)
-
-        # Hard restore zone: everything above hip_y - margin
-        hard_top = 0
-        hard_bottom = max(0, hip_y - blend_margin)
-        mask_region[hard_top:hard_bottom, :] = 255
-
-        # Soft blend zone: gradual transition from hip_y - margin to hip_y + margin
-        soft_top = max(0, hip_y - blend_margin)
-        soft_bottom = min(h, hip_y + blend_margin)
-        if soft_bottom > soft_top:
-            ramp = np.linspace(0.0, 1.0, soft_bottom - soft_top)
-            # Ramp goes from 1.0 (restore) at top to 0.0 (generated) at bottom
-            ramp = 1.0 - ramp  # Invert: 1.0 at hard_bottom, 0.0 at soft_bottom
-            for i, val in enumerate(ramp):
-                row = soft_top + i
-                if 0 <= row < h:
-                    mask_region[row, :] = int(val * 255)
-
-        # Also restore face region with extra confidence (in case hip estimation is off)
-        pad_x = int(fw * 0.15)
-        pad_y_top = int(fh * 0.40)
-        pad_y_bottom = int(fh * 0.60)
         face_x1 = max(0, fx - pad_x)
         face_y1 = max(0, fy - pad_y_top)
         face_x2 = min(w, fx + fw + pad_x)
         face_y2 = min(h, fy + fh + pad_y_bottom)
+
+        # Build restore mask: face + hair region only
+        mask_region = np.zeros((h, w), dtype=np.uint8)
         mask_region[face_y1:face_y2, face_x1:face_x2] = 255
 
-        # Feather the mask edges for smooth blending
-        blur_size = max(21, blend_margin // 2)
+        # Erode then blur for soft edges — the model output blends naturally
+        # into the face region without a visible seam
+        erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        mask_eroded = cv2.erode(mask_region, erode_k, iterations=2)
+        blur_size = max(15, min(fw, fh) // 8)
         if blur_size % 2 == 0:
             blur_size += 1
-        mask_soft = cv2.GaussianBlur(mask_region.astype(np.float32), (blur_size, blur_size), 0)
+        mask_soft = cv2.GaussianBlur(mask_eroded.astype(np.float32), (blur_size, blur_size), 0)
         mask_3d = mask_soft[:, :, np.newaxis] / 255.0
 
         # Composite: result * (1 - mask) + original * mask
+        # Only the face/hair region is restored from the original.
+        # The torso and waistband come from the model output — this allows
+        # proper garment replacement without ghost artifacts.
         restored = (result_np * (1.0 - mask_3d) + orig_np * mask_3d).astype(np.uint8)
 
         logger.info(
-            "upper_body_identity_restored face_box=(%d,%d,%d,%d) hip_y=%d blend_margin=%d cloth_type=%s",
-            fx, fy, fw, fh, hip_y, blend_margin, cloth_type,
+            "lower_body_face_identity_restored face_box=(%d,%d,%d,%d) region=(%d,%d,%d,%d) blur=%d",
+            fx, fy, fw, fh, face_x1, face_y1, face_x2, face_y2, blur_size,
         )
 
     else:
         # ── DRESSES / FULL_BODY / UPPER_BODY: Restore face + hair + neck ──
-        # For dresses, the model should change the entire outfit but preserve
-        # the person's face and identity.
         pad_x = int(fw * 0.15)
         pad_y_top = int(fh * 0.40)  # hair
         pad_y_bottom = int(fh * 0.60)  # neck + upper chest
@@ -1157,6 +1333,7 @@ def run_idm_vton_inference(
         external_mask,
         mask_quality_score,
         min_quality=min_quality,
+        cloth_type=cloth_type,
     )
     if mask_strategy == "automasker":
         strategy = WorkerMaskStrategy.AUTOMASKER
@@ -1177,6 +1354,7 @@ def run_idm_vton_inference(
         mask = automasker_mask
         mask_meta["mask_type_used"] = "automasker"
 
+    mask = _refine_target_inpaint_mask(mask, cloth_type)
     mask = apply_protected_mask(mask, protected_mask)
 
     # Lower-body silhouette enhancement: use the garment silhouette to guide
@@ -1185,7 +1363,7 @@ def run_idm_vton_inference(
     # clipped the mask to only pants/skirt labels, losing waistband context
     # and garment edge details. The diffusion model needs the full silhouette
     # to preserve garment structure (pockets, seams, belt loops, drape).
-    if cloth_type == "lower_body":
+    if ENABLE_GARMENT_SILHOUETTE_MASK and cloth_type == "lower_body":
         garm_gray = np.array(garm_img.convert("L"), dtype=np.uint8)
         _, garm_silhouette_mask = cv2.threshold(garm_gray, 240, 255, cv2.THRESH_BINARY_INV)
 
@@ -1212,21 +1390,44 @@ def run_idm_vton_inference(
         mask_np = np.array(mask.convert("L"), dtype=np.uint8)
         mask_np = np.maximum(mask_np, _lower_mask)
 
-        # Hard upper-body exclusion: zero out anything well above the mask's
-        # topmost row to prevent silhouette bleed into the torso.
-        # Keep a dynamic waistband margin so fitted pants retain structure
-        # while looser garments still preserve enough torso context.
+        # Extend mask upward to cover the waistband transition zone.
+        # WHY: For lower-body try-on, the mask MUST cover the full waistband
+        # so the model can properly replace the old garment at the transition
+        # between shirt and pants. A gap here causes ghost artifacts.
+        #
+        # Strategy: Find the hip line from DensePose/SCHP and extend the mask
+        # upward to cover the waistband region (hip_y - 80px to hip_y).
+        # Use the garment silhouette's horizontal extent at the hip level.
+        _hip_region_top = int(height * 0.42)  # fallback: ~42% from top
+        _hip_region_bottom = int(height * 0.55)  # fallback: ~55% from top
+
+        # Try to find hip position from the mask itself
+        _rows_with_mask = np.where(mask_np.any(axis=1))[0]
+        if len(_rows_with_mask) > 0:
+            _mask_top = int(_rows_with_mask[0])
+            _mask_bottom = int(_rows_with_mask[-1])
+            # The waistband is near the top of the mask
+            # Extend upward by 80px to cover the full waistband transition
+            _extend_up = max(0, _mask_top - 80)
+            # Find horizontal extent at the current mask top
+            _top_band = mask_np[_mask_top:min(_mask_top + 15, height), :]
+            _col_sums = np.sum(_top_band > 127, axis=0)
+            _nonzero_cols = np.where(_col_sums > 0)[0]
+            if len(_nonzero_cols) > 0:
+                _left_bound = max(0, int(_nonzero_cols[0]) - 15)
+                _right_bound = min(width, int(_nonzero_cols[-1]) + 15)
+                # Fill the extension region — this covers the waistband
+                mask_np[_extend_up:_mask_top, _left_bound:_right_bound] = 255
+
+        # Hard upper-body exclusion: remove mask pixels that are clearly
+        # above the waistband (more than 100px above the mask's top).
+        # This prevents the garment silhouette from bleeding into the torso
+        # while still allowing the waistband region to be inpainted.
         rows_with_mask = np.where(mask_np.any(axis=1))[0]
         if len(rows_with_mask) > 0:
             mask_top = int(rows_with_mask[0])
-
-            waistband_margin = max(24, int(TARGET_H * 0.028))
-            if garment_subtype in {"cargo_pants", "wide_leg", "palazzo"}:
-                waistband_margin = max(30, int(TARGET_H * 0.032))
-            elif garment_subtype in {"leggings", "joggers", "shorts"}:
-                waistband_margin = max(20, int(TARGET_H * 0.022))
-
-            exclude_top = max(0, mask_top - waistband_margin)
+            # Only exclude pixels WELL above the mask — not the waistband
+            exclude_top = max(0, mask_top - 100)
             mask_np[:exclude_top, :] = 0
 
         mask = Image.fromarray(mask_np, mode="L")
@@ -1239,7 +1440,7 @@ def run_idm_vton_inference(
     # instead of following the person's actual leg geometry.
     # DensePose provides body structure; the garment image provides texture.
     # The mask just needs to cover the full garment region.
-    if cloth_type in ("dresses", "full_body"):
+    if ENABLE_GARMENT_SILHOUETTE_MASK and cloth_type in ("dresses", "full_body"):
         garm_gray = np.array(garm_img.convert("L"), dtype=np.uint8)
         _, garm_silhouette_mask = cv2.threshold(garm_gray, 240, 255, cv2.THRESH_BINARY_INV)
 
@@ -1354,13 +1555,12 @@ def run_idm_vton_inference(
             )
 
             prompt_c = "a photo of " + garment_desc
-            if cloth_type == "lower_body":
-                _sub = (garment_subtype or "").strip().lower().replace(" ", "_")
-                _cue = _FABRIC_CUES.get(_sub, "")
-                if _cue:
-                    prompt_c = f"a photo of {garment_desc}, {_cue}"
-                else:
-                    prompt_c = f"a photo of {garment_desc}, detailed fabric texture, natural folds"
+            _sub = (garment_subtype or "").strip().lower().replace("-", "_").replace(" ", "_")
+            _cue = _FABRIC_CUES.get(_sub, "")
+            if _cue:
+                prompt_c = f"a photo of {garment_desc}, {_cue}"
+            elif cloth_type in ("lower_body", "dresses", "full_body"):
+                prompt_c = f"a photo of {garment_desc}, detailed fabric texture, natural folds"
             prompt_embeds_c, _, _, _ = pipe.encode_prompt(
                 prompt_c,
                 num_images_per_prompt=1,
@@ -1402,8 +1602,22 @@ def run_idm_vton_inference(
         crop_w, crop_h = crop_size
         feather_px = max(12, min(crop_w, crop_h) // 20)
 
+        # For lower_body, use MUCH larger feathering at the top (waist) edge
+        # to prevent the stitched composite artifact at the waist boundary.
+        # The crop boundary at the waist is where model-generated pixels meet
+        # original pixels — insufficient feathering creates a visible horizontal seam.
+        top_feather = feather_px
+        if cloth_type == "lower_body":
+            # 3x larger feathering at waist boundary for smooth blending
+            top_feather = max(feather_px * 3, 60)
+
         # Build 1D feathering ramps for each edge
         alpha = np.ones((crop_h, crop_w), dtype=np.float32)
+
+        # Top edge fade (only if crop doesn't start at image top)
+        if int(top) > 0:
+            ramp = np.linspace(0.0, 1.0, top_feather)
+            alpha[:top_feather, :] *= ramp[:, np.newaxis]
 
         # Bottom edge fade (only if not at image bottom)
         orig_bottom = int(top) + crop_h
@@ -1441,6 +1655,7 @@ def run_idm_vton_inference(
         if cloth_type in ("dresses", "full_body", "lower_body"):
             final_img = _restore_person_identity(
                 final_img, human_img_orig, cloth_type,
+                crop_top=int(top),
             )
 
         return final_img, mask_meta
@@ -1470,6 +1685,15 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     garment_subtype = job_input.get("garment_subtype", "")
     cloth_type = job_input.get("cloth_type", "upper_body")
     mask_url = job_input.get("mask_image_url") or job_input.get("mask_url") or ""
+    mask_quality_raw = job_input.get("mask_quality_score")
+    try:
+        mask_quality_score = (
+            float(mask_quality_raw)
+            if mask_quality_raw is not None and mask_quality_raw != ""
+            else None
+        )
+    except (TypeError, ValueError):
+        mask_quality_score = None
 
     _LOWER_SUBTYPE_KEYWORDS: dict[str, list[str]] = {
         "jeans": ["jeans", "denim"],
@@ -1489,10 +1713,31 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "straight_fit": ["straight fit", "regular fit", "classic fit"],
         "slim_fit": ["slim fit", "skinny", "tight fit"],
         "relaxed_fit": ["relaxed fit", "loose fit", "comfort fit"],
+        "dhoti_pants": ["dhoti pants", "dhoti"],
     }
-    if not garment_subtype and cloth_type in ("lower_body",):
-        _desc_lower = (garment_desc or "").lower()
-        for _sub, _kws in _LOWER_SUBTYPE_KEYWORDS.items():
+    _FULL_SUBTYPE_KEYWORDS: dict[str, list[str]] = {
+        "saree": ["saree", "sari"],
+        "lehenga": ["lehenga"],
+        "dupatta": ["dupatta"],
+        "anarkali": ["anarkali"],
+        "abaya": ["abaya"],
+        "kaftan": ["kaftan", "caftan"],
+        "kimono": ["kimono"],
+        "thobe": ["thobe", "thawb"],
+        "sherwani": ["sherwani"],
+        "salwar_suit": ["salwar suit", "salwar kameez", "churidar suit"],
+        "sharara": ["sharara", "gharara"],
+        "kurti": ["kurti"],
+        "kurta_set": ["kurta set", "long kurta", "kurta dress"],
+        "dress": ["dress", "one piece", "one-piece"],
+        "gown": ["gown"],
+        "jumpsuit": ["jumpsuit"],
+        "overall": ["overall", "overalls", "dungaree"],
+        "coord": ["co-ord", "coord", "co ord", "matching set", "two piece"],
+    }
+    if not garment_subtype:
+        _desc_lower = (garment_desc or "").lower().replace("-", " ")
+        for _sub, _kws in {**_FULL_SUBTYPE_KEYWORDS, **_LOWER_SUBTYPE_KEYWORDS}.items():
             if any(_kw in _desc_lower for _kw in _kws):
                 garment_subtype = _sub
                 break
@@ -1513,6 +1758,23 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         "dresses": "dresses",
         "overall": "dresses",
         "full_body": "dresses",
+        "full": "dresses",
+        "full_outfit": "dresses",
+        "outfit": "dresses",
+        "one_piece": "dresses",
+        "one-piece": "dresses",
+        "jumpsuit": "dresses",
+        "kurti": "dresses",
+        "saree": "dresses",
+        "sari": "dresses",
+        "lehenga": "dresses",
+        "anarkali": "dresses",
+        "abaya": "dresses",
+        "kaftan": "dresses",
+        "kimono": "dresses",
+        "thobe": "dresses",
+        "sherwani": "dresses",
+        "dupatta": "dresses",
     }
     vton_type = cloth_type_map.get(cloth_type, "upper_body")
 
@@ -1568,7 +1830,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         external_mask=external_mask,
         protected_mask=None,
         mask_strategy="external" if external_mask is not None else "automasker",
-        mask_quality_score=None,
+        mask_quality_score=mask_quality_score,
         guidance_scale=effective_guidance,
     )
 

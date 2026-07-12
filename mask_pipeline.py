@@ -95,13 +95,26 @@ GARMENT_PROFILES: dict[str, GarmentProfile] = {
     "chinos": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, True),
     "bermuda": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, False),
     "maxi_skirt": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, False),
+    "dhoti_pants": GarmentProfile("lower", "lower_body", False, True, False, False, False, False, False),
     # Dresses / full body
     "dress": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
     "gown": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
     "saree": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
     "lehenga": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "dupatta": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "anarkali": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "abaya": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "kaftan": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "kimono": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "thobe": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "sherwani": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "salwar_suit": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "sharara": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "kurti": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
     "jumpsuit": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
     "kurta_set": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "coord": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
+    "tracksuit": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
     "overall": GarmentProfile("full", "dresses", True, True, True, True, True, True, False),
     "bodysuit": GarmentProfile("full", "dresses", True, True, True, True, True, True, True),
 }
@@ -143,9 +156,26 @@ GARMENT_GEOMETRY: dict[str, GarmentGeometry] = {
     "chinos": GarmentGeometry("lower", protect_upper=True),
     "bermuda": GarmentGeometry("lower", protect_upper=True, expansion_down=10),
     "maxi_skirt": GarmentGeometry("lower", protect_upper=True, expansion_down=120),
+    "dhoti_pants": GarmentGeometry("lower", protect_upper=True, expansion_width=35, expansion_down=40),
     # Dresses
     "dress": GarmentGeometry("full"),
     "gown": GarmentGeometry("full", expansion_down=60),
+    "saree": GarmentGeometry("full", expansion_width=35, expansion_down=80),
+    "lehenga": GarmentGeometry("full", expansion_width=40, expansion_down=80),
+    "dupatta": GarmentGeometry("full", expansion_width=30, expansion_down=40),
+    "anarkali": GarmentGeometry("full", expansion_width=25, expansion_down=70),
+    "abaya": GarmentGeometry("full", expansion_width=35, expansion_down=70),
+    "kaftan": GarmentGeometry("full", expansion_width=45, expansion_down=60),
+    "kimono": GarmentGeometry("full", expansion_width=35, expansion_down=50),
+    "thobe": GarmentGeometry("full", expansion_width=25, expansion_down=60),
+    "sherwani": GarmentGeometry("full", expansion_width=20, expansion_down=30),
+    "salwar_suit": GarmentGeometry("full", expansion_width=25, expansion_down=55),
+    "sharara": GarmentGeometry("full", expansion_width=45, expansion_down=80),
+    "kurti": GarmentGeometry("full", expansion_width=20, expansion_down=45),
+    "kurta_set": GarmentGeometry("full", expansion_width=20, expansion_down=45),
+    "jumpsuit": GarmentGeometry("full", expansion_width=15, expansion_down=35),
+    "coord": GarmentGeometry("full", expansion_width=15, expansion_down=35),
+    "tracksuit": GarmentGeometry("full", expansion_width=15, expansion_down=35),
 }
 
 
@@ -167,7 +197,7 @@ EDITABLE_BODY_REGIONS: dict[str, frozenset[int]] = {
 _FAMILY_LOWER: frozenset[str] = frozenset({
     "jeans", "trousers", "pants", "shorts", "skirt", "mini_skirt",
     "long_skirt", "leggings", "joggers", "wide_leg", "palazzo",
-    "cargo_pants", "chinos", "bermuda", "maxi_skirt",
+    "cargo_pants", "chinos", "bermuda", "maxi_skirt", "dhoti_pants",
 })
 
 
@@ -642,6 +672,7 @@ def select_worker_mask_strategy(
     external_mask: Image.Image | None,
     mask_quality_score: float | None,
     min_quality: float = 62.0,
+    cloth_type: str = "upper_body",
 ) -> WorkerMaskStrategy:
     """
     Decide initial mask strategy on GPU.
@@ -649,6 +680,30 @@ def select_worker_mask_strategy(
     Low-quality external masks are ignored in favour of AutoMasker.
     """
     if external_mask is None:
+        return WorkerMaskStrategy.AUTOMASKER
+    mask_np = np.array(external_mask.convert("L"), dtype=np.uint8)
+    coverage = float(np.mean(mask_np > 127)) * 100.0
+    coverage_upper_bounds = {
+        "upper_body": 55.0,
+        "lower_body": 65.0,
+        "dresses": 75.0,
+        "full_body": 75.0,
+    }
+    upper_bound = coverage_upper_bounds.get(cloth_type, 60.0)
+    if coverage <= 1.0 or coverage > upper_bound:
+        logger.info(
+            "external_mask_rejected coverage=%.1f cloth_type=%s upper_bound=%.1f",
+            coverage,
+            cloth_type,
+            upper_bound,
+        )
+        return WorkerMaskStrategy.AUTOMASKER
+    if mask_quality_score is None and cloth_type in ("lower_body", "dresses", "full_body"):
+        logger.info(
+            "external_mask_rejected missing_quality_score cloth_type=%s coverage=%.1f",
+            cloth_type,
+            coverage,
+        )
         return WorkerMaskStrategy.AUTOMASKER
     if mask_quality_score is not None and mask_quality_score < min_quality:
         logger.info(
