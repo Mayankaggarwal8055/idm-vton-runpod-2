@@ -842,10 +842,6 @@ _GARMENT_PROMPT_ATTRS: dict[str, dict[str, str]] = {
 }
 
 
-# =============================================================================
-# Fabric cues — subtype-specific texture language injected into prompts
-# =============================================================================
-
 _FABRIC_CUES: dict[str, str] = {
     "jeans": "denim texture with visible stitching, realistic wash pattern, natural creasing at knees and hips",
     "trousers": "woven fabric with pressed crease, smooth structured finish",
@@ -871,8 +867,6 @@ def _build_subtype_aware_prompt(garment_desc: str, garment_subtype: str = "") ->
 
     Filters out "n/a" values (sleeves/neckline/collar for lower-body) to
     avoid wasting prompt capacity on irrelevant attributes.
-
-    Appends fabric cues for texture-specific conditioning.
     """
     key = (garment_subtype or "").strip().lower().replace(" ", "_").replace("-", "_")
     attrs = _GARMENT_PROMPT_ATTRS.get(key)
@@ -889,12 +883,10 @@ def _build_subtype_aware_prompt(garment_desc: str, garment_subtype: str = "") ->
         if val and val.lower() != "n/a":
             parts.append(val)
 
-    # Append fabric cues for texture-specific conditioning
     fabric_cue = _FABRIC_CUES.get(key, "")
     if fabric_cue:
         parts.append(fabric_cue)
 
-    # Append generic texture reinforcement for lower-body
     if key:
         parts.append("detailed fabric texture")
         parts.append("natural garment folds")
@@ -936,16 +928,16 @@ def _restore_person_identity(
     cloth_type: str,
 ) -> Image.Image:
     """
-    Hard-composite the person's face and upper identity from the original
-    onto the diffusion result.
+    Hard-composite the person's identity from the original onto the diffusion result.
 
     The IDM-VTON model with strength=1.0 denoises the entire image,
-    regenerating the face even though it's not in the inpaint mask.
-    This function restores the person's identity by detecting the face
-    in the original and blending it back with a soft mask.
+    regenerating areas even though they're not in the inpaint mask.
+    This function restores the person's identity by blending original
+    pixels back with a soft mask.
 
-    For dresses/full-body: restore face + hair + neck + upper chest.
-    For lower_body: restore face + hair + neck + shoulders + upper torso.
+    For lower_body: restore FULL upper body (face + hair + torso + arms + background above waist).
+    For dresses/full_body: restore face + hair + neck + upper chest.
+    For upper_body: restore face + hair + neck + shoulders.
     """
     import cv2
 
@@ -979,39 +971,113 @@ def _restore_person_identity(
     # Take the largest face
     (fx, fy, fw, fh) = max(faces, key=lambda r: r[2] * r[3])
 
-    # Build identity region mask: face + generous margins for hair, jawline, neck
-    # Top: extends into hair (40% above face box)
-    # Bottom: extends into neck/upper chest (60% below face box)
-    # Sides: extends to include ears (15% wider each side)
-    pad_x = int(fw * 0.15)
-    pad_y_top = int(fh * 0.40)  # hair
-    pad_y_bottom = int(fh * 0.60)  # neck + upper chest
+    if cloth_type == "lower_body":
+        # ── LOWER BODY: Restore FULL upper body ──
+        # The model should only change the lower body. Everything above the
+        # waist must be preserved from the original to avoid identity drift,
+        # torso regeneration, and background mismatch.
+        #
+        # Strategy: Use hip line as the boundary. Restore everything above
+        # the hips with a soft blend at the waist boundary.
+        #
+        # Find the hip line from the face position (heuristic when pose is unavailable):
+        # Face is typically at ~15-25% of image height. Hips are at ~50-60%.
+        face_center_y = (fy + fh // 2)
+        face_height_ratio = face_center_y / h
 
-    face_x1 = max(0, fx - pad_x)
-    face_y1 = max(0, fy - pad_y_top)
-    face_x2 = min(w, fx + fw + pad_x)
-    face_y2 = min(h, fy + fh + pad_y_bottom)
+        # Estimate hip Y from face position: face at ~20% → hips at ~55%
+        # This is a robust heuristic for portrait photos
+        if face_height_ratio < 0.35:
+            # Face in upper third — standard portrait, hips at ~55%
+            hip_y = int(h * 0.55)
+        elif face_height_ratio < 0.5:
+            # Face in middle — full body shot, hips at ~50%
+            hip_y = int(h * 0.50)
+        else:
+            # Face in lower half — close-up, restore up to 70%
+            hip_y = int(h * 0.70)
 
-    # Create soft-edged mask using distance transform for smooth blending
-    mask_region = np.zeros((h, w), dtype=np.uint8)
-    mask_region[face_y1:face_y2, face_x1:face_x2] = 255
+        # Add a soft margin around the hip boundary for smooth blending
+        blend_margin = max(30, int(h * 0.04))
 
-    # Erode then blur for soft edges (feather ~15px)
-    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mask_eroded = cv2.erode(mask_region, erode_k, iterations=2)
-    blur_size = max(15, min(fw, fh) // 8)
-    if blur_size % 2 == 0:
-        blur_size += 1
-    mask_soft = cv2.GaussianBlur(mask_eroded.astype(np.float32), (blur_size, blur_size), 0)
-    mask_3d = mask_soft[:, :, np.newaxis] / 255.0
+        # Build the restore mask: full upper body + soft edge at hip line
+        mask_region = np.zeros((h, w), dtype=np.uint8)
 
-    # Composite: result * (1 - mask) + original * mask
-    restored = (result_np * (1.0 - mask_3d) + orig_np * mask_3d).astype(np.uint8)
+        # Hard restore zone: everything above hip_y - margin
+        hard_top = 0
+        hard_bottom = max(0, hip_y - blend_margin)
+        mask_region[hard_top:hard_bottom, :] = 255
 
-    logger.info(
-        "face_identity_restored face_box=(%d,%d,%d,%d) region=(%d,%d,%d,%d) blur=%d",
-        fx, fy, fw, fh, face_x1, face_y1, face_x2, face_y2, blur_size,
-    )
+        # Soft blend zone: gradual transition from hip_y - margin to hip_y + margin
+        soft_top = max(0, hip_y - blend_margin)
+        soft_bottom = min(h, hip_y + blend_margin)
+        if soft_bottom > soft_top:
+            ramp = np.linspace(0.0, 1.0, soft_bottom - soft_top)
+            # Ramp goes from 1.0 (restore) at top to 0.0 (generated) at bottom
+            ramp = 1.0 - ramp  # Invert: 1.0 at hard_bottom, 0.0 at soft_bottom
+            for i, val in enumerate(ramp):
+                row = soft_top + i
+                if 0 <= row < h:
+                    mask_region[row, :] = int(val * 255)
+
+        # Also restore face region with extra confidence (in case hip estimation is off)
+        pad_x = int(fw * 0.15)
+        pad_y_top = int(fh * 0.40)
+        pad_y_bottom = int(fh * 0.60)
+        face_x1 = max(0, fx - pad_x)
+        face_y1 = max(0, fy - pad_y_top)
+        face_x2 = min(w, fx + fw + pad_x)
+        face_y2 = min(h, fy + fh + pad_y_bottom)
+        mask_region[face_y1:face_y2, face_x1:face_x2] = 255
+
+        # Feather the mask edges for smooth blending
+        blur_size = max(21, blend_margin // 2)
+        if blur_size % 2 == 0:
+            blur_size += 1
+        mask_soft = cv2.GaussianBlur(mask_region.astype(np.float32), (blur_size, blur_size), 0)
+        mask_3d = mask_soft[:, :, np.newaxis] / 255.0
+
+        # Composite: result * (1 - mask) + original * mask
+        restored = (result_np * (1.0 - mask_3d) + orig_np * mask_3d).astype(np.uint8)
+
+        logger.info(
+            "upper_body_identity_restored face_box=(%d,%d,%d,%d) hip_y=%d blend_margin=%d cloth_type=%s",
+            fx, fy, fw, fh, hip_y, blend_margin, cloth_type,
+        )
+
+    else:
+        # ── DRESSES / FULL_BODY / UPPER_BODY: Restore face + hair + neck ──
+        # For dresses, the model should change the entire outfit but preserve
+        # the person's face and identity.
+        pad_x = int(fw * 0.15)
+        pad_y_top = int(fh * 0.40)  # hair
+        pad_y_bottom = int(fh * 0.60)  # neck + upper chest
+
+        face_x1 = max(0, fx - pad_x)
+        face_y1 = max(0, fy - pad_y_top)
+        face_x2 = min(w, fx + fw + pad_x)
+        face_y2 = min(h, fy + fh + pad_y_bottom)
+
+        # Create soft-edged mask using distance transform for smooth blending
+        mask_region = np.zeros((h, w), dtype=np.uint8)
+        mask_region[face_y1:face_y2, face_x1:face_x2] = 255
+
+        # Erode then blur for soft edges (feather ~15px)
+        erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        mask_eroded = cv2.erode(mask_region, erode_k, iterations=2)
+        blur_size = max(15, min(fw, fh) // 8)
+        if blur_size % 2 == 0:
+            blur_size += 1
+        mask_soft = cv2.GaussianBlur(mask_eroded.astype(np.float32), (blur_size, blur_size), 0)
+        mask_3d = mask_soft[:, :, np.newaxis] / 255.0
+
+        # Composite: result * (1 - mask) + original * mask
+        restored = (result_np * (1.0 - mask_3d) + orig_np * mask_3d).astype(np.uint8)
+
+        logger.info(
+            "face_identity_restored face_box=(%d,%d,%d,%d) region=(%d,%d,%d,%d) blur=%d",
+            fx, fy, fw, fh, face_x1, face_y1, face_x2, face_y2, blur_size,
+        )
 
     return Image.fromarray(restored, mode="RGB")
 
@@ -1288,8 +1354,6 @@ def run_idm_vton_inference(
             )
 
             prompt_c = "a photo of " + garment_desc
-            # Lower-body: strengthen the cloth prompt with texture cues so
-            # the garment UNet encoder receives fabric-specific conditioning.
             if cloth_type == "lower_body":
                 _sub = (garment_subtype or "").strip().lower().replace(" ", "_")
                 _cue = _FABRIC_CUES.get(_sub, "")
@@ -1329,45 +1393,12 @@ def run_idm_vton_inference(
                 guidance_scale=effective_guidance,
             )[0]
 
-    # ── Lower-body fabric enhancement (post-diffusion) ────────────────
-    # The diffusion model generates correct shape but may soften denim
-    # texture. Apply CLAHE + unsharp masked to the inpaint region to
-    # restore fabric detail without affecting identity regions.
-    if cloth_type == "lower_body":
-        _out_np = np.array(images[0].convert("RGB"), dtype=np.uint8)
-        _mask_np = np.array(mask.convert("L"), dtype=np.uint8)
-        _inpaint_bool = _mask_np > 127
-
-        if np.any(_inpaint_bool):
-            # CLAHE: adaptive histogram equalization brings out denim texture
-            _lab = cv2.cvtColor(_out_np, cv2.COLOR_RGB2LAB)
-            _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            _lab[:, :, 0] = _clahe.apply(_lab[:, :, 0])
-            _enhanced = cv2.cvtColor(_lab, cv2.COLOR_LAB2RGB)
-
-            # Unsharp mask: sharpen edges (seams, stitching) in garment region
-            _blurred = cv2.GaussianBlur(_enhanced, (0, 0), 3)
-            _sharpened = cv2.addWeighted(_enhanced, 1.5, _blurred, -0.5, 0)
-
-            # Blend: only apply within the inpaint mask, feathered at edges
-            _mask_float = _mask_np.astype(np.float32) / 255.0
-            _blur_k = max(5, min(_out_np.shape[:2]) // 100)
-            if _blur_k % 2 == 0:
-                _blur_k += 1
-            _mask_float = cv2.GaussianBlur(_mask_float, (_blur_k, _blur_k), 0)
-            _mask_3d = _mask_float[:, :, np.newaxis]
-
-            _out_float = _out_np.astype(np.float32)
-            _enh_float = _sharpened.astype(np.float32)
-            _blended = (_enh_float * _mask_3d + _out_float * (1.0 - _mask_3d)).astype(np.uint8)
-            images[0] = Image.fromarray(_blended, mode="RGB")
-
     if auto_crop and crop_size is not None:
         out_img = images[0].resize(crop_size)
         final_img = human_img_orig.copy()
 
         # Edge-aware feathering: blend the crop output with the original
-        # at the crop boundary to avoid visible seams.
+        # at the crop boundary to avoid visible seams
         crop_w, crop_h = crop_size
         feather_px = max(12, min(crop_w, crop_h) // 20)
 
@@ -1391,30 +1422,13 @@ def run_idm_vton_inference(
             ramp = np.linspace(1.0, 0.0, feather_px)
             alpha[:, -feather_px:] *= ramp[np.newaxis, :]
 
-        # ── Green artifact fix: mask-aware feathering ─────────────────
-        # For lower-body, the feathering blends original person pixels at
-        # the crop boundary. If the original has green backgrounds/clothing
-        # near the boundary, those leak into the output as green artifacts.
-        # Fix: at feathering edges, compare original vs output and prefer
-        # the output (diffused) pixels when they differ significantly,
-        # preventing original background bleed.
+        # Alpha composite: output * alpha + original * (1 - alpha)
         out_np = np.array(out_img.convert("RGB"), dtype=np.float32)
         orig_crop = np.array(
             human_img_orig.crop((int(left), int(top), orig_right, orig_bottom))
             .resize((crop_w, crop_h)),
             dtype=np.float32,
         )
-
-        if cloth_type == "lower_body":
-            # Detect "bleed zones" where original has unusual colors
-            # (green/colored background) that don't match the output
-            _diff = np.abs(out_np - orig_crop).mean(axis=2)
-            _feathered_region = alpha < 0.99
-            # Where difference is large in feathered region, force output pixels
-            # This prevents green background from bleeding through
-            _large_diff = (_diff > 25.0) & _feathered_region
-            alpha[_large_diff] = 1.0
-
         blended = (out_np * alpha[..., np.newaxis] + orig_crop * (1.0 - alpha[..., np.newaxis])).astype(np.uint8)
         final_img.paste(Image.fromarray(blended), (int(left), int(top)))
 
@@ -1440,12 +1454,11 @@ def run_idm_vton_inference(
 
 def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     """
-    Direct inference — no preprocessing service.
+    Direct inference with preprocessing support.
 
-    Downloads raw person + garment images, resizes to target size,
-    and runs IDM-VTON with the model's built-in AutoMasker for mask
-    generation. No external masks, no protected regions, no preprocessing
-    pipeline.
+    Downloads person + garment images, optionally downloads preprocessing
+    mask, and runs IDM-VTON. When a preprocessing mask is provided, it
+    is used instead of the AutoMasker for better garment placement.
     """
     from quality_validation import validate_output_quality
 
@@ -1456,18 +1469,26 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     garment_desc = job_input.get("garment_desc") or job_input.get("garment_description") or "garment"
     garment_subtype = job_input.get("garment_subtype", "")
     cloth_type = job_input.get("cloth_type", "upper_body")
+    mask_url = job_input.get("mask_image_url") or job_input.get("mask_url") or ""
 
-    # ── Subtype fallback: infer from garment_desc if preprocessing didn't send it ──
     _LOWER_SUBTYPE_KEYWORDS: dict[str, list[str]] = {
         "jeans": ["jeans", "denim"],
-        "trousers": ["trousers", "slacks"],
-        "shorts": ["shorts", "bermuda"],
-        "joggers": ["joggers", "jogger"],
-        "leggings": ["leggings", "tights"],
-        "cargo_pants": ["cargo"],
-        "wide_leg": ["wide leg", "wide-leg"],
+        "trousers": ["trousers", "slacks", "formal pant", "formal trouser"],
+        "pants": ["pants", "pant"],
+        "shorts": ["shorts", "bermuda", "board shorts", "cargo shorts"],
+        "joggers": ["joggers", "jogger", "sweatpants", "sweat pant"],
+        "leggings": ["leggings", "tights", "yoga pants"],
+        "cargo_pants": ["cargo", "cargo pants", "utility pants"],
+        "wide_leg": ["wide leg", "wide-leg", "flared", "bootcut", "bell bottom"],
         "chinos": ["chinos", "chino"],
-        "skirt": ["skirt"],
+        "skirt": ["skirt", "mini skirt", "pencil skirt", "circle skirt"],
+        "palazzo": ["palazzo", "culottes"],
+        "bermuda": ["bermuda", "capri"],
+        "track_pants": ["track pant", "track pants", "trackpant"],
+        "pajama_pants": ["pajama pant", "pajama pants", "pyjama pant"],
+        "straight_fit": ["straight fit", "regular fit", "classic fit"],
+        "slim_fit": ["slim fit", "skinny", "tight fit"],
+        "relaxed_fit": ["relaxed fit", "loose fit", "comfort fit"],
     }
     if not garment_subtype and cloth_type in ("lower_body",):
         _desc_lower = (garment_desc or "").lower()
@@ -1475,6 +1496,7 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
             if any(_kw in _desc_lower for _kw in _kws):
                 garment_subtype = _sub
                 break
+
     steps = int(job_input.get("steps", DENOISE_STEPS))
     seed = int(job_input.get("seed", random.randint(0, 2**31 - 1)))
     trace_id = job_input.get("trace_id", "")
@@ -1507,6 +1529,15 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     download_start = time.perf_counter()
     person_img = download_image(person_url)
     garment_img = download_image(garment_url)
+    # Download preprocessing mask if provided (from preprocessing service)
+    external_mask = None
+    if mask_url:
+        try:
+            external_mask = download_image(mask_url)
+            logger.info("preprocessing_mask_downloaded url=%s", mask_url[:80])
+        except Exception as exc:
+            logger.warning("preprocessing_mask_download_failed error=%s — falling back to AutoMasker", exc)
+            external_mask = None
     download_ms = (time.perf_counter() - download_start) * 1000
 
     # ── Garment RGB diagnostics ──
@@ -1519,14 +1550,9 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
 
     # ── Direct inference — always use AutoMasker, no preprocessing ──
     effective_guidance = GUIDANCE_SCALE
-    # Lower-body: boost guidance to enforce garment texture fidelity.
-    # Higher guidance = model follows garment reference more strongly,
-    # producing denim/pants material instead of generic soft fabric.
     if vton_type == "lower_body":
         effective_guidance = 4.0
-    # Only reduce guidance for dark UPPER-BODY garments where over-saturation
-    # is the primary failure mode. For dresses, keep full guidance.
-    elif garm_mean_all < 80.0 and vton_type == "upper_body":
+    elif garm_mean_all < 80.0 and vton_type != "dresses":
         effective_guidance = GUIDANCE_SCALE * 0.75
 
     inference_start = time.perf_counter()
@@ -1539,9 +1565,9 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
         steps=steps,
         seed=seed,
         auto_crop=True,
-        external_mask=None,
+        external_mask=external_mask,
         protected_mask=None,
-        mask_strategy="automasker",
+        mask_strategy="external" if external_mask is not None else "automasker",
         mask_quality_score=None,
         guidance_scale=effective_guidance,
     )
