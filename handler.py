@@ -1053,6 +1053,19 @@ _FABRIC_CUES: dict[str, str] = {
     "kimono": "wrapped robe fabric with smooth sleeves and cross-front fold",
     "thobe": "crisp robe fabric with long vertical folds and clean placket",
     "sherwani": "structured brocade or jacquard texture with front closure and formal embroidery",
+    "tshirt": "soft cotton jersey with subtle ribbed crew collar and natural shoulder seams",
+    "shirt": "woven cotton with collar, button placket, and natural fabric folds",
+    "blouse": "lightweight fabric with soft draped fit, buttons or tie front, and natural folds",
+    "polo": "pique cotton with collar and short sleeves, casual knit texture",
+    "sweater": "knit wool or cotton with visible stitch texture and ribbed cuffs and hem",
+    "hoodie": "soft fleece with hood and kangaroo pocket, casual drawstring waist",
+    "jacket": "structured outerwear with front opening, lapels or zip, and lining",
+    "coat": "long structured outerwear with front closure and natural length drape",
+    "blazer": "structured tailored jacket with lapels and single or double button closure",
+    "cardigan": "knit open-front sweater with buttons or draped front, worn over an inner top",
+    "open_front": "front opens at the center, worn open or closed over an inner top, visible lapels",
+    "kurta": "ethnic tunic with side slits, mandarin collar, and soft vertical folds",
+    "long_kurta": "long ethnic tunic extending past the hips with side slits and soft vertical folds",
 }
 
 
@@ -1069,6 +1082,9 @@ def _build_subtype_aware_prompt(garment_desc: str, garment_subtype: str = "") ->
     key = (garment_subtype or "").strip().lower().replace(" ", "_").replace("-", "_")
     attrs = _GARMENT_PROMPT_ATTRS.get(key)
     if not attrs:
+        cue = _FABRIC_CUES.get(key, "")
+        if cue:
+            return "model wearing " + garment_desc + ", " + cue
         return "model is wearing " + garment_desc
 
     parts = ["model wearing " + garment_desc]
@@ -1542,7 +1558,12 @@ def run_idm_vton_inference(
                 "symmetric skirt, ignored leg positions"
             )
     else:
-        prompt = "model is wearing " + garment_desc
+        # upper_body: use the subtype-aware prompt + fabric cues so ethnic
+        # (kurta/kurti), open-front (kimono/cardigan/jacket/blazer/coat) and
+        # long (long kurta/tunic) garments are described accurately instead of
+        # a generic "model is wearing <desc>", which loses their defining
+        # traits (open front, drape, length, ethnicity).
+        prompt = _build_subtype_aware_prompt(garment_desc, garment_subtype)
         negative_prompt = _build_source_specific_negative()
 
     with torch.inference_mode():
@@ -1652,7 +1673,7 @@ def run_idm_vton_inference(
         # We MUST hard-composite the person's face from the original to
         # preserve identity. This is not a heuristic — it's required for
         # any diffusion-based try-on with strength=1.0.
-        if cloth_type in ("dresses", "full_body", "lower_body"):
+        if cloth_type in ("upper_body", "dresses", "full_body", "lower_body"):
             final_img = _restore_person_identity(
                 final_img, human_img_orig, cloth_type,
                 crop_top=int(top),
@@ -1811,11 +1832,13 @@ def run_inference(job_input: dict[str, Any], job_id: str) -> dict[str, Any]:
     )
 
     # ── Direct inference — always use AutoMasker, no preprocessing ──
+    # NOTE: previously dark garments (mean < 80) got guidance * 0.75, which
+    # weakened garment conditioning and washed out black/dark garments
+    # (lost texture, turned gray). Dark garments need FULL guidance so the
+    # model actually applies the (low-luminance) garment color/texture.
     effective_guidance = GUIDANCE_SCALE
     if vton_type == "lower_body":
         effective_guidance = 4.0
-    elif garm_mean_all < 80.0 and vton_type != "dresses":
-        effective_guidance = GUIDANCE_SCALE * 0.75
 
     inference_start = time.perf_counter()
     result, mask_meta = run_idm_vton_inference(
